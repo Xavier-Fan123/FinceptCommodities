@@ -75,6 +75,7 @@ locally and instantly.
 ```
 server.py        stdlib http.server (no Flask) + layered TTL cache
 sources.py       compact fetchers — yfinance (quotes/history/curve) + CFTC (COT)
+energy_chemicals.py  Energy Hub product map + key-less news aggregation
 analytics/       the tested commodity analytics (term structure, risk,
                  seasonality, positioning, spreads, …), self-contained
 web/             index.html · style.css · app.js (the dashboard UI)

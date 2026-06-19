@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fincept Commodities — Local</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0a0a'/><path d='M8 2 L14 8 L8 14 L2 8 Z' fill='%23f59e0b'/></svg>">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">◆ COMMODITIES <span class="sub">local terminal</span></div>
+    <nav class="tabs" id="tabs"></nav>
+    <div class="status">
+      <span id="updated" class="updated"></span>
+      <button id="refresh" title="Force-refresh data (bypasses cache)">↻</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="overview" class="panel">
+      <div class="panel-head">
+        <h2 id="ov-title">All commodities</h2>
+        <span id="ov-meta" class="meta"></span>
+        <input id="filter" type="text" placeholder="filter symbol or name…" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="table-wrap">
+        <table id="grid">
+          <thead>
+            <tr>
+              <th data-k="id">Symbol</th>
+              <th data-k="name">Name</th>
+              <th class="num" data-k="price">Last</th>
+              <th class="num" data-k="change">Chg</th>
+              <th class="num" data-k="change_percent">Chg %</th>
+              <th class="num" data-k="volume">Volume</th>
+              <th data-k="exchange">Exch</th>
+            </tr>
+          </thead>
+          <tbody id="grid-body"></tbody>
+        </table>
+        <div id="ov-loading" class="loading">Loading market data…</div>
+      </div>
+    </section>
+
+    <section id="spreads" class="panel hidden">
+      <div class="panel-head">
+        <h2>Spreads</h2>
+        <span id="sp-meta" class="meta">processing margins &amp; relative value · 1y daily</span>
+      </div>
+      <div class="cards" id="spreads-cards"></div>
+    </section>
+
+    <section id="energy-hub" class="panel hidden">
+      <div class="panel-head">
+        <h2>Energy &amp; Petrochemicals</h2>
+        <span id="eh-meta" class="meta"></span>
+      </div>
+      <div id="energy-hub-body"></div>
+    </section>
+
+    <section id="news" class="panel hidden">
+      <div class="panel-head news-head">
+        <h2>News</h2>
+        <span id="news-meta" class="meta"></span>
+        <div id="news-topics" class="topic-tabs"></div>
+      </div>
+      <div id="news-body"></div>
+    </section>
+
+    <section id="detail" class="panel hidden"></section>
+  </main>
+
+  <footer>
+    <span>Local · free public data (Yahoo Finance · CFTC) · no login · <a href="/ENERGY.md" class="footer-doc" target="_blank" title="energy commodities primer">energy primer</a></span>
+    <span id="footer-note"></span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

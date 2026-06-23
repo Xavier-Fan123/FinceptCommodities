@@ -161,6 +161,33 @@ class SpreadAnalyzer:
             **stats,
         })
 
+    def single_crack_series(self, crude_history: Any, product_history: Any,
+                            product_label: str = "Product",
+                            window: int = 60) -> Dict[str, Any]:
+        """Single-product crack in USD/bbl: product($/gal)*42 - crude($/bbl).
+
+        The gasoline (RBOB-WTI) or distillate (ULSD-WTI) refining margin for
+        one cut, isolating which product is pulling the barrel.
+        """
+        try:
+            cl = normalize_history(crude_history)["close"].rename("cl")
+            pr = normalize_history(product_history)["close"].rename("pr")
+        except (TypeError, ValueError) as exc:
+            return err(f"single_crack_series: {exc}")
+        joined = pd.concat([cl, pr], axis=1, join="inner").dropna()
+        if joined.empty:
+            return err("single_crack_series: no overlapping dates")
+        spread = joined["pr"] * GAL - joined["cl"]
+        stats = self._spread_stats(spread, window)
+        return ok({
+            "spread_type": "crack",
+            "product": product_label,
+            "unit": "USD/bbl",
+            "current": float(spread.iloc[-1]),
+            "series": series_tail(spread),
+            **stats,
+        })
+
     def crush_spread_series(self, soybeans_history: Any, meal_history: Any,
                             oil_history: Any, window: int = 60) -> Dict[str, Any]:
         """Historical board crush series (ZS cents/bu, ZM $/ton, ZL cents/lb)."""

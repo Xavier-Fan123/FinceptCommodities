@@ -9,25 +9,30 @@ const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov
 const CARD_TITLES = {
   price: "Price · 1Y",
   curve: "Futures Curve",
+  calspread: "Calendar Spreads",
   risk: "Risk · 1Y",
   season: "Seasonality · Avg Monthly Return",
   bands: "Seasonal Price Bands",
   cot: "COT Positioning",
   context: "Energy Chain Context",
   inv: "Inventories · EIA Weekly",
+  balance: "Crude Balance · EIA Weekly",
 };
 const PANEL_CARDS = {
   history: ["price", "risk"],
-  curve: ["curve"],
+  curve: ["curve", "calspread"],
   seasonality: ["season", "bands"],
   cot: ["cot"],
   inventory: ["inv"],
+  balance: ["balance"],
   context: ["context"],
 };
 // Commodities with an EIA weekly inventory series (mirrors sources._EIA_SERIES)
 const INVENTORY_IDS = new Set(["wti", "natgas", "rbob", "heating_oil"]);
+// US crude supply/demand balance is WTI-specific (mirrors server panel_balance)
+const BALANCE_IDS = new Set(["wti"]);
 const ENERGY_CONTEXT_IDS = new Set(["wti", "brent", "natgas", "rbob", "heating_oil"]);
-const ALL_CARDS = ["price", "curve", "risk", "season", "bands", "cot", "inv", "context"];
+const ALL_CARDS = ["price", "curve", "calspread", "risk", "season", "bands", "cot", "inv", "balance", "context"];
 
 let state = {
   view: "overview",        // overview | detail | spreads
@@ -296,8 +301,9 @@ function showDetail(id) {
   ]));
 
   const cards = el("div", { class: "cards" });
-  const keys = ["price", "curve", "risk", "season", "bands", "cot"];
+  const keys = ["price", "curve", "calspread", "risk", "season", "bands", "cot"];
   if (INVENTORY_IDS.has(id)) keys.push("inv");
+  if (BALANCE_IDS.has(id)) keys.push("balance");
   if (ENERGY_CONTEXT_IDS.has(id)) keys.push("context");
   for (const key of keys) {
     cards.appendChild(el("div", { class: "card", id: "card-" + key },
@@ -336,6 +342,7 @@ function loadPanels(id, fresh) {
   fetchPanel(id, "seasonality", renderSeasonPanels, fresh);
   fetchPanel(id, "cot", renderCotPanel, fresh);
   if (INVENTORY_IDS.has(id)) fetchPanel(id, "inventory", renderInventoryPanel, fresh);
+  if (BALANCE_IDS.has(id)) fetchPanel(id, "balance", renderBalancePanel, fresh);
   if (ENERGY_CONTEXT_IDS.has(id)) fetchContextPanel(id, fresh);
 }
 
@@ -466,6 +473,41 @@ function renderCurvePanel(d) {
     }));
   }
   setCard("curve", ts && ts.success ? `${ts.contracts_used} contracts` : null, body);
+  renderCalspreadPanel(d);
+}
+
+// Calendar spreads ride on the curve fetch (d.calendar_spreads, d.quote_unit).
+function renderCalspreadPanel(d) {
+  const cs = d.calendar_spreads;
+  if (!cs || !cs.success) {
+    cardError("calspread", (cs && cs.error) || "no curve data",
+      () => retryPanel(state.detailId, "curve", renderCurvePanel));
+    return;
+  }
+  const unit = d.quote_unit || "";
+  const p = cs.prompt_spread || {};
+  const struct = cs.structure;
+  const structCls = struct === "backwardation" ? "up" : struct === "contango" ? "down" : "flat";
+  const body = [el("div", { class: "spread-cur " + structCls, html:
+    `${sign(p.spread)}${fmtNum(p.spread, 2)} <span class="spread-unit">${unit} · M1−M2 · ${struct}</span>` })];
+  const ladder = cs.ladder || [];
+  if (ladder.length >= 2) {
+    const bars = svgBars(ladder.map(L => L.spread), { labels: ladder.map(L => L.bucket_months + "m"), h: 92 });
+    const wrap = withHover(bars, ladder.length, (i) => {
+      const L = ladder[i];
+      return `M1 vs +${L.bucket_months}mo (${L.far}) · ${sign(L.spread)}${fmtNum(L.spread, 2)} ${unit} · ann ${sign(L.annualized_roll_yield_pct)}${fmtNum(L.annualized_roll_yield_pct, 1)}%`;
+    }, { band: true, h: 92 });
+    body.push(el("div", { class: "note", text: `front spread vs deferred tenors (${unit}) · +ve = backwardation` }));
+    body.push(wrap);
+  }
+  const b2b = cs.front_to_back || {};
+  body.push(el("div", { class: "stat-grid", html:
+    stat("Prompt M1−M2", `${sign(p.spread)}${fmtNum(p.spread, 2)}`, structCls) +
+    stat("Roll yield (ann)", `${sign(p.annualized_roll_yield_pct)}${fmtNum(p.annualized_roll_yield_pct, 1)}%`, dirClass(p.annualized_roll_yield_pct)) +
+    stat("Front→back", `${sign(b2b.spread)}${fmtNum(b2b.spread, 2)}`, dirClass(b2b.spread)) +
+    stat("Structure", struct || "—", structCls),
+  }));
+  setCard("calspread", cs.contracts_used ? `${cs.contracts_used} contracts · ${p.near}→${p.far}` : null, body);
 }
 
 function renderSeasonPanels(d) {
@@ -586,6 +628,77 @@ function renderInventoryPanel(d) {
     body.push(wrap);
   }
   setCard("inv", `${inv.series_label || "EIA"} · as of ${inv.as_of}`, body);
+}
+
+function renderBalancePanel(d) {
+  const bal = d.balance;
+  if (!bal || !bal.success) {
+    cardError("balance", (bal && bal.error) || "no balance data",
+      () => retryPanel(state.detailId, "balance", renderBalancePanel));
+    return;
+  }
+  const cmap = {};
+  for (const c of bal.components || []) cmap[c.id] = c;
+  const cushing = cmap.cushing;
+  const body = [];
+  if (cushing && cushing.current !== undefined && cushing.current !== null) {
+    const posCls = cushing.position === "below_5yr_range" ? "up"
+      : cushing.position === "above_5yr_range" ? "down" : "flat";
+    body.push(el("div", { class: "spread-cur", html:
+      `${fmtNum(cushing.current, 1)} <span class="spread-unit">${cushing.unit} Cushing · </span>` +
+      `<span class="${posCls}">${(cushing.position || "").replace(/_/g, " ") || "—"}</span>` }));
+    if (cushing.note) body.push(el("div", { class: "note", text: cushing.note }));
+  }
+  const ch = bal.cushing && bal.cushing.seasonal_chart;
+  const weeks = (ch && ch.weeks) || [];
+  const rows = weeks.map(w => ({ month: String(w.week), hist_min: w.hist_min,
+    hist_max: w.hist_max, hist_avg: w.hist_avg, current_year: w.current_year }));
+  if (rows.filter(r => r.hist_min !== null && r.hist_min !== undefined).length >= 2) {
+    const chart = svgBands(rows, { h: 120, labels: rows.map((r, i) => String(i + 1)), labelStep: 9 });
+    const wrap = withHover(chart, rows.length, (i) => {
+      const b = rows[i];
+      if (!b || b.hist_min === null || b.hist_min === undefined) return `wk ${i + 1} · no band`;
+      let txt = `wk ${i + 1} · ${fmtNum(b.hist_min, 1)}–${fmtNum(b.hist_max, 1)} · avg ${fmtNum(b.hist_avg, 1)}`;
+      if (b.current_year !== null && b.current_year !== undefined) txt += ` · now ${fmtNum(b.current_year, 1)}`;
+      return txt;
+    }, { h: 120 });
+    body.push(el("div", { class: "note",
+      text: `Cushing stocks (${cushing ? cushing.unit : "MMbbl"}) · grey = 5y weekly range · amber = ${ch.current_year}` }));
+    body.push(wrap);
+  }
+  const order = ["production", "imports", "runs", "utilization", "exports", "spr"];
+  const cells = order.map(id => cmap[id]).filter(Boolean).map(balanceCell).join("");
+  if (cells) {
+    body.push(el("div", { class: "note", text: "supply · refinery demand · trade — colour = crude-price read" }));
+    body.push(el("div", { class: "bal-grid", html: cells }));
+  }
+  setCard("balance", `US balance · as of ${bal.as_of || "—"}`, body);
+}
+
+// crude-price read of a component's latest weekly move (draws/exports/runs up = bullish)
+function balanceChangeClass(comp) {
+  const ch = comp.last_change;
+  if (ch === null || ch === undefined || !comp.bullish) return "flat";
+  if (comp.bullish === "low") return ch < 0 ? "up" : ch > 0 ? "down" : "flat";
+  return ch > 0 ? "up" : ch < 0 ? "down" : "flat";
+}
+
+function balanceCell(comp) {
+  if (comp.error || comp.current === undefined || comp.current === null) {
+    return `<div class="bal-cell"><span class="bal-name">${comp.short}</span>` +
+      `<span class="bal-val na">—</span></div>`;
+  }
+  const dg = comp.unit === "%" ? 1 : (Math.abs(comp.current) >= 100 ? 0 : 1);
+  const chg = comp.last_change;
+  const chgTxt = (chg === null || chg === undefined) ? ""
+    : `${sign(chg)}${fmtNum(chg, Math.abs(chg) < 1 ? 2 : 1)}`;
+  const vs = (comp.vs_avg_pct === null || comp.vs_avg_pct === undefined) ? ""
+    : `${sign(comp.vs_avg_pct)}${fmtNum(comp.vs_avg_pct, 0)}% vs5y`;
+  const sub = [chgTxt, vs].filter(Boolean).join(" · ");
+  return `<div class="bal-cell">` +
+    `<span class="bal-name">${comp.short}</span>` +
+    `<span class="bal-val">${fmtNum(comp.current, dg)}<span class="bal-unit"> ${comp.unit}</span></span>` +
+    `<span class="bal-sub ${balanceChangeClass(comp)}">${sub || "—"}</span></div>`;
 }
 
 function renderContextPanel(d) {

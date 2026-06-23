@@ -34,6 +34,9 @@ direct jump into relevant news.
 - **Price · 1Y** — daily close area chart
 - **Futures Curve** — term structure with contango/backwardation tag,
   front→back spread, annualized roll yield and front→12m slope
+- **Calendar Spreads** — the prompt M1→M2 time spread plus a 1/2/3/6/12-month
+  ladder with annualized roll, read straight off the live curve: the trader's
+  view of tightness (and it surfaces the natural-gas seasonal sawtooth too)
 - **Risk · 1Y** — total return, annualized vol, VaR/CVaR 95%, max drawdown,
   skew, plus a 1y drawdown chart
 - **Seasonality** — average return by calendar month with win rates on hover
@@ -46,11 +49,15 @@ direct jump into relevant news.
 - **Inventories · EIA Weekly** (energy only: wti, natgas, rbob, heating_oil) —
   current stocks vs the 5-year weekly seasonal band, weekly build/draw with
   streak, and position vs the 5-year average
+- **Crude Balance · EIA Weekly** (wti) — the full US crude balance: Cushing
+  stocks (with their own 5-year band), SPR, production, refinery runs and
+  utilization, and crude imports/exports, each coloured by its crude-price read
 
 **Spreads tab** — live relative-value monitors computed from the same cached
-histories: **3-2-1 crack spread** (refining margin), **WTI−Brent**,
-**gold/silver ratio**, and the **soybean board crush**, each with 1y chart,
-percentile, z-score, and mean-reversion half-life.
+histories: the refining suite — **WTI** and **Brent 3-2-1 cracks** plus the
+single-cut **gasoline (RBOB−WTI)** and **distillate (ULSD−WTI)** cracks — then
+**WTI−Brent**, the **gold/silver ratio**, and the **soybean board crush**, each
+with 1y chart, percentile, z-score, and mean-reversion half-life.
 
 **Energy Hub** — product-map coverage for crude, NGL/LPG, LNG, refined
 products, olefins, aromatics, polymers, fertilizers, and carbon/power proxies.
@@ -88,7 +95,7 @@ API (all JSON, all local):
 ```
 /api/overview[?sector=energy]
 /api/commodity/{id}                          all panels, fetched in parallel
-/api/commodity/{id}/{history|curve|seasonality|cot|inventory}
+/api/commodity/{id}/{history|curve|seasonality|cot|inventory|balance}
 /api/spreads
 /api/energy-chemicals
 /api/energy-chemicals/product/{id}
@@ -114,7 +121,9 @@ Data sources, all free:
   dataset, including Brent `06765T` and Henry Hub `023651`)
 - **EIA API v2** (free key) — weekly energy inventories: crude ex-SPR
   `WCESTUS1`, total gasoline `WGTSTUS1`, distillates `WDISTUS1`, Lower-48
-  working gas `NW2_EPG0_SWO_R48_BCF`
+  working gas `NW2_EPG0_SWO_R48_BCF`; plus the WTI crude balance from the
+  weekly supply route (`petroleum/sum/sndw`): Cushing stocks, SPR, production,
+  refinery runs, utilization, and crude imports/exports
 
 ## Notes
 

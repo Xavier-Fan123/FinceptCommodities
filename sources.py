@@ -258,6 +258,89 @@ def eia_inventory(commodity: str, weeks: int = 340) -> Any:
     return out
 
 
+# ---------------- EIA weekly crude balance (US petroleum supply) ----------------
+
+# The Weekly Supply Estimates route (petroleum/sum/sndw) carries the whole US
+# crude balance in one dataset, so the entire panel is a single request.
+# Series ids verified live (2026-06): stocks in MBBL -> MMbbl (x0.001),
+# flows in MBBL/D -> Mb/d (x0.001), utilization already in %.
+_EIA_SUPPLY_ROUTE = "petroleum/sum/sndw"
+
+_CRUDE_BALANCE: List[Dict[str, Any]] = [
+    {"id": "cushing", "series": "W_EPC0_SAX_YCUOK_MBBL",
+     "label": "Cushing crude stocks", "short": "Cushing",
+     "kind": "stock", "scale": 0.001, "unit": "MMbbl",
+     "seasonal": True, "bullish": "low", "chart": True,
+     "note": "WTI delivery hub — low/falling Cushing tightens the front spread"},
+    {"id": "spr", "series": "WCSSTUS1",
+     "label": "Strategic Petroleum Reserve", "short": "SPR",
+     "kind": "stock", "scale": 0.001, "unit": "MMbbl",
+     "seasonal": False, "bullish": None},
+    {"id": "production", "series": "WCRFPUS2",
+     "label": "US crude production", "short": "Production",
+     "kind": "flow", "scale": 0.001, "unit": "Mb/d",
+     "seasonal": False, "bullish": "low"},
+    {"id": "runs", "series": "WCRRIUS2",
+     "label": "Refiner crude runs", "short": "Refinery runs",
+     "kind": "flow", "scale": 0.001, "unit": "Mb/d",
+     "seasonal": True, "bullish": "high"},
+    {"id": "utilization", "series": "WPULEUS3",
+     "label": "Refinery utilization", "short": "Refinery util",
+     "kind": "pct", "scale": 1.0, "unit": "%",
+     "seasonal": True, "bullish": "high"},
+    {"id": "exports", "series": "WCREXUS2",
+     "label": "US crude exports", "short": "Exports",
+     "kind": "flow", "scale": 0.001, "unit": "Mb/d",
+     "seasonal": False, "bullish": "high"},
+    {"id": "imports", "series": "WCEIMUS2",
+     "label": "US crude imports", "short": "Imports",
+     "kind": "flow", "scale": 0.001, "unit": "Mb/d",
+     "seasonal": False, "bullish": "low"},
+]
+
+
+def crude_balance_components() -> List[Dict[str, Any]]:
+    """Static metadata for the US crude-balance components (no network)."""
+    return [dict(c) for c in _CRUDE_BALANCE]
+
+
+def eia_crude_balance(weeks: int = 280) -> Any:
+    """US crude supply/demand balance from the EIA weekly supply route.
+
+    One request fetches every component (Cushing, SPR, production, runs,
+    utilization, exports, imports). Returns {series_id: [{date, value}]},
+    oldest-first and scaled to display units (~280 weeks covers a 5y band).
+    """
+    key = eia_key()
+    if not key:
+        return {"error": "no EIA API key (set EIA_API_KEY or eia_api_key.txt)"}
+    series_ids = [c["series"] for c in _CRUDE_BALANCE]
+    scale_by = {c["series"]: c["scale"] for c in _CRUDE_BALANCE}
+    start = (datetime.now() - timedelta(weeks=weeks + 8)).strftime("%Y-%m-%d")
+    url = f"{_EIA_BASE}/{_EIA_SUPPLY_ROUTE}/data/"
+    params = {
+        "api_key": key, "frequency": "weekly", "data[0]": "value",
+        "facets[series][]": series_ids, "start": start,
+        "sort[0][column]": "period", "sort[0][direction]": "desc",
+        "length": 5000,
+    }
+    r = _HTTP.get(url, params=params, timeout=30,
+                  headers={"User-Agent": "FinceptCommoditiesLocal/1.0",
+                           "Accept": "application/json"})
+    r.raise_for_status()
+    rows = (r.json().get("response") or {}).get("data") or []
+    by_series: Dict[str, List[Dict[str, Any]]] = {sid: [] for sid in series_ids}
+    for row in rows:
+        sid = row.get("series")
+        v = _f(row.get("value"))
+        if sid in by_series and v is not None and row.get("period"):
+            by_series[sid].append({"date": str(row["period"]),
+                                    "value": v * scale_by[sid]})
+    for sid in by_series:
+        by_series[sid].reverse()  # API returns newest first
+    return by_series
+
+
 def cot(commodity: str, weeks: int = 156,
         report_type: str = "disaggregated") -> Any:
     """COT records from the CFTC public reporting API (exact contract code)."""

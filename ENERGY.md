@@ -84,6 +84,18 @@ Energy specifics to look for:
   it's nicknamed the **widow-maker**.
 - **RBOB** carries a summer premium (driving season + costlier summer spec).
 
+**The *Calendar Spreads* panel** turns the curve into the trader's working
+view. The headline is the **prompt spread** (M1−M2) in the contract's own units:
+positive means the front is *richer* than the next month — backwardation, the
+signature of a market pulling barrels out of storage *now*. Below it the
+**ladder** sets the front against the contracts nearest ~1, 2, 3, 6 and 12
+months out, so you can see how fast the discount deepens with tenor and the
+annualized roll each bucket implies. A backwardated, *steepening* prompt is the
+cleanest curve-only read of tightness, and it tends to move *before* flat price.
+(For natural gas the same panel exposes the seasonal sawtooth: the deferred
+buckets straddle winter so the ladder bars flip sign along the strip, and the
+Mar→Apr **widow-maker** sits in the adjacent-month spreads.)
+
 ---
 
 ## 3. Seasonality — the *Seasonality* and *Seasonal Price Bands* panels
@@ -133,6 +145,15 @@ cracks above $50. The tab shows the current level's 1-year percentile,
 z-score, and a mean-reversion half-life — spreads are mean-reverting by
 nature (they're a *margin*, arbitraged by physical players), which is why
 those statistics are shown.
+
+The tab runs the **whole refining suite** off both benchmarks: the **WTI** and
+**Brent 3-2-1** cracks (the Brent crack is closer to the margin a coastal or
+European refiner actually sees), plus the two single-cut cracks —
+**gasoline (RBOB−WTI)** and **distillate (ULSD−WTI)**, each `product×42 − crude`
+in $/bbl. The single cracks decompose the 3-2-1 and show *which* product is
+pulling the barrel: in summer the gasoline crack usually leads; a firm
+distillate crack flags freight, industrial or winter-heating strength. A wide
+crack of any flavour pays refiners to buy more crude — bullish crude demand.
 
 Also on the tab:
 
@@ -202,6 +223,25 @@ shown green); **above** the band with builds = glut (red). Gas traders watch
 whether storage will reach ~3,700+ Bcf by November (comfortable winter) —
 follow the amber line's trajectory against the band through injection season.
 
+**The *Crude Balance* panel (wti page)** widens that single crude-stocks number
+into the whole US balance, all from the same Wednesday EIA report:
+
+- **Cushing stocks** — the WTI delivery hub, with its own 5-year weekly band.
+  This is the tank farm that prices the front contract: a low or falling
+  Cushing (below the band) is what *makes* the prompt spread backwardate.
+  Cross-check it against the *Calendar Spreads* panel — they should agree.
+- **SPR** — the Strategic Petroleum Reserve, still well below its pre-2022 level.
+- **Supply**: US field **production** and **imports**.
+- **Refinery demand**: crude **runs** and **utilization %** — how hard refiners
+  are pulling crude (seasonally peaking in summer driving season).
+- **Exports** — the valve that drains US crude to the world; it widens when
+  **WTI−Brent** is negative enough to pay the freight (tie it back to *Spreads*).
+
+Each cell is coloured by its *crude-price* read, not its raw direction: a draw
+in Cushing, or a rise in exports/runs, is green (tightening); a production or
+import build is red. The identity underneath:
+`Δstocks ≈ production + imports − refinery runs − exports`.
+
 Monthly big-picture reports: EIA STEO, OPEC MOMR, IEA Oil Market Report.
 
 ---
@@ -234,10 +274,13 @@ What the numbers typically look like, and why:
    where this year sits in the 10-year envelope.
 2. Same page, *Futures Curve*: find the winter premium in the strip; check
    the roll-yield stat.
-3. Open **wti** → *COT Positioning*: where is managed money vs its 3-year
-   range? Is the divergence note on?
-4. **Spreads tab**: is the 3-2-1 crack above or below its 1-year mean? What
-   does that imply for refinery runs — and therefore crude demand?
+3. Open **wti** → *Calendar Spreads*: is the prompt (M1−M2) backwardated and
+   does the ladder steepen out? Then *Crude Balance*: is Cushing below its
+   5-year band (confirming it), and are runs/exports draining stock? Then
+   *COT Positioning*: where is managed money vs its 3-year range?
+4. **Spreads tab**: is the 3-2-1 crack above or below its 1-year mean, and is
+   the gasoline or distillate crack leading? What does that imply for refinery
+   runs — and therefore crude demand?
 5. Open **rbob** → *Seasonality*: the spring ramp into driving season, and
    the win rates behind it.
 6. Back on **natgas** → *Inventories*: is the amber storage line tracking

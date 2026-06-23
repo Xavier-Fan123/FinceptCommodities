@@ -11,7 +11,7 @@ Run:
 API:
     /api/overview[?sector=energy][&fresh=1]
     /api/commodity/{id}                       all panels, fetched in parallel
-    /api/commodity/{id}/{history|curve|seasonality|cot}
+    /api/commodity/{id}/{history|curve|seasonality|cot|inventory|balance}
     /api/spreads[?fresh=1]                    crack / crush / WTI-Brent / gold-silver
     /api/energy-chemicals                     energy/petrochemical product map
     /api/energy-chemicals/product/{id}        product context and trade lens
@@ -40,7 +40,7 @@ if HERE not in sys.path:
 import sources  # noqa: E402
 import energy_chemicals  # noqa: E402
 from analytics.config import list_commodities, list_sectors, get_spec  # noqa: E402
-from analytics.term_structure import TermStructureAnalyzer  # noqa: E402
+from analytics.term_structure import TermStructureAnalyzer, calendar_spreads  # noqa: E402
 from analytics.seasonality import SeasonalityAnalyzer  # noqa: E402
 from analytics.positioning import COTAnalyzer  # noqa: E402
 from analytics.risk import CommodityRiskAnalyzer  # noqa: E402
@@ -171,17 +171,76 @@ def panel_history(cid, fresh=False):
 
 
 def panel_curve(cid, fresh=False):
-    out = {"id": cid, "updated": int(time.time())}
+    spec = get_spec(cid)
+    out = {"id": cid, "quote_unit": spec["quote_unit"] if spec else None,
+           "updated": int(time.time())}
     try:
         c = cached(f"curve:{cid}", CURVE_TTL, lambda: sources.curve(cid),
                    swr=CURVE_SWR, fresh=fresh)
     except Exception as exc:  # noqa: BLE001
         out["curve"] = []
         out["term_structure"] = {"success": False, "error": str(exc)}
+        out["calendar_spreads"] = {"success": False, "error": str(exc)}
         return out
     out["curve"] = c or []
-    out["term_structure"] = (TermStructureAnalyzer().analyze(c) if c
-                             else {"success": False, "error": "no curve data"})
+    no_curve = {"success": False, "error": "no curve data"}
+    out["term_structure"] = TermStructureAnalyzer().analyze(c) if c else no_curve
+    # Calendar spreads ride on the same curve fetch (no extra network call).
+    out["calendar_spreads"] = calendar_spreads(c) if c else dict(no_curve)
+    return out
+
+
+def panel_balance(cid, fresh=False):
+    """US crude supply/demand balance (WTI). Reuses InventoryAnalyzer per
+    EIA series so each component gets its level, weekly change, streak and
+    5-year band; Cushing also carries a seasonal-band chart."""
+    out = {"id": cid, "updated": int(time.time())}
+    if cid != "wti":
+        out["balance"] = {"success": False,
+                          "error": "crude balance is US/WTI-specific"}
+        return out
+    try:
+        data = cached("balance:wti", INV_TTL, sources.eia_crude_balance,
+                      swr=INV_SWR, fresh=fresh)
+    except Exception as exc:  # noqa: BLE001
+        out["balance"] = {"success": False, "error": str(exc)}
+        return out
+    if isinstance(data, dict) and data.get("error"):
+        out["balance"] = {"success": False, "error": data["error"]}
+        return out
+
+    analyzer = InventoryAnalyzer()
+    components, cushing = [], None
+    for c in sources.crude_balance_components():
+        recs = data.get(c["series"]) if isinstance(data, dict) else None
+        comp = {k: c[k] for k in ("id", "label", "short", "unit", "kind",
+                                  "bullish", "seasonal")}
+        if c.get("note"):
+            comp["note"] = c["note"]
+        if isinstance(recs, list) and len(recs) >= 2:
+            an = analyzer.analyze(recs, unit=c["unit"], band_years=5)
+            if an.get("success"):
+                comp["current"] = an.get("current_level")
+                comp["last_change"] = an.get("last_change")
+                comp["streak"] = an.get("streak")
+                comp["as_of"] = an.get("as_of")
+                band = an.get("five_year_band") or {}
+                comp["vs_avg_pct"] = band.get("vs_avg_pct")
+                comp["position"] = band.get("position")
+                comp["zscore"] = band.get("zscore")
+                if c.get("chart"):
+                    cushing = {"label": c["label"], "unit": c["unit"],
+                               "five_year_band": an.get("five_year_band"),
+                               "seasonal_chart": an.get("seasonal_chart")}
+            else:
+                comp["error"] = an.get("error")
+        else:
+            comp["error"] = "no data"
+        components.append(comp)
+
+    as_of = max((c["as_of"] for c in components if c.get("as_of")), default=None)
+    out["balance"] = {"success": True, "as_of": as_of,
+                      "components": components, "cushing": cushing}
     return out
 
 
@@ -242,7 +301,7 @@ def panel_inventory(cid, fresh=False):
 
 _PANELS = {"history": panel_history, "curve": panel_curve,
            "seasonality": panel_seasonality, "cot": panel_cot,
-           "inventory": panel_inventory}
+           "inventory": panel_inventory, "balance": panel_balance}
 
 
 def build_detail(cid, fresh=False):
@@ -271,6 +330,9 @@ def build_detail(cid, fresh=False):
     out["curve"] = parts["curve"].get("curve", [])
     out["term_structure"] = parts["curve"].get(
         "term_structure", fail(parts["curve"], "curve"))
+    out["calendar_spreads"] = parts["curve"].get(
+        "calendar_spreads", fail(parts["curve"], "calendar_spreads"))
+    out["balance"] = parts["balance"].get("balance", fail(parts["balance"], "balance"))
     out["seasonality"] = parts["seasonality"].get(
         "seasonality", fail(parts["seasonality"], "seasonality"))
     out["positioning"] = parts["cot"].get(
@@ -315,12 +377,21 @@ def overview_payload(sector=None, fresh=False):
 # ---------------- spreads ----------------
 
 _SPREAD_DEFS = [
-    {"key": "crack_321", "title": "3-2-1 Crack Spread", "unit": "USD/bbl",
+    {"key": "crack_321", "title": "WTI 3-2-1 Crack Spread", "unit": "USD/bbl",
      "legs": ["wti", "rbob", "heating_oil"],
-     "note": "Refining margin: 3 bbl crude → 2 bbl gasoline + 1 bbl distillate"},
+     "note": "Refining margin: 3 bbl WTI → 2 bbl gasoline + 1 bbl distillate"},
+    {"key": "brent_crack_321", "title": "Brent 3-2-1 Crack Spread", "unit": "USD/bbl",
+     "legs": ["brent", "rbob", "heating_oil"],
+     "note": "Refining margin off the global benchmark: 3 Brent → 2 gasoline + 1 distillate"},
+    {"key": "gasoline_crack", "title": "Gasoline Crack (RBOB − WTI)", "unit": "USD/bbl",
+     "legs": ["wti", "rbob"],
+     "note": "Single-cut margin: RBOB×42 − WTI. The gasoline pull on the barrel"},
+    {"key": "distillate_crack", "title": "Distillate Crack (ULSD − WTI)", "unit": "USD/bbl",
+     "legs": ["wti", "heating_oil"],
+     "note": "Single-cut margin: ULSD×42 − WTI. The diesel pull on the barrel"},
     {"key": "wti_brent", "title": "WTI − Brent", "unit": "USD/bbl",
      "legs": ["wti", "brent"],
-     "note": "US inland light-sweet vs waterborne global benchmark"},
+     "note": "US inland light-sweet vs waterborne global benchmark; ≈ export arb"},
     {"key": "gold_silver", "title": "Gold / Silver Ratio", "unit": "ratio",
      "legs": ["gold", "silver"],
      "note": "Ounces of silver per ounce of gold"},
@@ -355,6 +426,13 @@ def build_spreads(fresh=False):
         elif sdef["key"] == "crack_321":
             result = analyzer.crack_spread_series(
                 hists["wti"], hists["rbob"], hists["heating_oil"])
+        elif sdef["key"] == "brent_crack_321":
+            result = analyzer.crack_spread_series(
+                hists["brent"], hists["rbob"], hists["heating_oil"])
+        elif sdef["key"] == "gasoline_crack":
+            result = analyzer.single_crack_series(hists["wti"], hists["rbob"], "RBOB")
+        elif sdef["key"] == "distillate_crack":
+            result = analyzer.single_crack_series(hists["wti"], hists["heating_oil"], "ULSD")
         elif sdef["key"] == "wti_brent":
             result = analyzer.diff_spread(hists["wti"], hists["brent"],
                                           "WTI", "Brent")

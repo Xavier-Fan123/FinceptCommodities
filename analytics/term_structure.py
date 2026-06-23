@@ -187,3 +187,91 @@ class TermStructureAnalyzer:
                 "roll_yield_formula": "ln(F_near/F_far) / dt (positive in backwardation)",
             },
         })
+
+
+def _curve_points(contracts: List[Dict[str, Any]],
+                  ref: datetime) -> List[Dict[str, Any]]:
+    """Parse [{expiry, price}] into sorted {expiry, t_years, price} points."""
+    points = []
+    for c in contracts or []:
+        if not isinstance(c, dict):
+            continue
+        expiry = parse_expiry(c.get("expiry") or c.get("month") or c.get("label"), ref)
+        try:
+            price = float(c.get("price") if c.get("price") is not None else c.get("settle"))
+        except (TypeError, ValueError):
+            continue
+        if expiry is None or not math.isfinite(price) or price <= 0:
+            continue
+        t_years = max((expiry - ref).days, 1) / Constants.DAYS_IN_YEAR
+        points.append({"expiry": expiry, "t_years": t_years, "price": price})
+    points.sort(key=lambda p: p["expiry"])
+    return points
+
+
+def calendar_spreads(contracts: List[Dict[str, Any]],
+                     as_of: Optional[str] = None) -> Dict[str, Any]:
+    """Calendar (time) spreads off a futures curve.
+
+    The trader's view of the curve: the prompt M1-M2 spread, a time-distance
+    ladder (front vs the contract nearest ~+1/2/3/6/12 months), and the
+    adjacent-month "spread curve". Spreads are in the contract's own price
+    units; a *positive* near-minus-far spread means the front is richer than
+    the deferred contract — i.e. backwardation, the signature of a tight,
+    inventory-drawing market.
+    """
+    if not contracts or not isinstance(contracts, list):
+        return err("contracts must be a non-empty list of {expiry, price}")
+    ref = (parse_expiry(as_of) if as_of else None) or datetime.now()
+    points = _curve_points(contracts, ref)
+    if len(points) < 2:
+        return err("need at least 2 parseable contracts to build spreads",
+                   parsed_count=len(points))
+
+    def label(p: Dict[str, Any]) -> str:
+        return p["expiry"].strftime("%Y-%m")
+
+    def pair(near: Dict[str, Any], far: Dict[str, Any]) -> Dict[str, Any]:
+        dt = max(far["t_years"] - near["t_years"], 1e-6)
+        spread = near["price"] - far["price"]
+        return {
+            "near": label(near), "far": label(far),
+            "near_price": near["price"], "far_price": far["price"],
+            "months_apart": round((far["t_years"] - near["t_years"]) * 12, 1),
+            "spread": spread,
+            "spread_pct": spread / far["price"] * 100,
+            "annualized_roll_yield_pct": math.log(near["price"] / far["price"]) / dt * 100,
+            "structure": ("backwardation" if spread > 0
+                          else "contango" if spread < 0 else "flat"),
+        }
+
+    front = points[0]
+    prompt = pair(points[0], points[1])
+
+    # Ladder: front vs the contract nearest to +1/2/3/6/12 months out.
+    ladder, seen = [], {0}
+    for months in (1, 2, 3, 6, 12):
+        target = front["t_years"] + months / 12.0
+        cand = min(range(1, len(points)),
+                   key=lambda i: abs(points[i]["t_years"] - target))
+        if cand in seen:
+            continue
+        seen.add(cand)
+        entry = pair(front, points[cand])
+        entry["bucket_months"] = months
+        ladder.append(entry)
+
+    # Adjacent-month spread curve (the shape the front spread sits on).
+    segments = [{"near": label(n), "far": label(f), "spread": n["price"] - f["price"]}
+                for n, f in zip(points, points[1:])]
+
+    return ok({
+        "as_of": ref.strftime("%Y-%m-%d"),
+        "contracts_used": len(points),
+        "front_contract": {"expiry": label(front), "price": front["price"]},
+        "structure": prompt["structure"],
+        "prompt_spread": prompt,
+        "front_to_back": pair(points[0], points[-1]),
+        "ladder": ladder,
+        "segments": segments,
+    })

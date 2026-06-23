@@ -235,6 +235,19 @@ thead th.sort-desc::after { content: " ▼"; color: var(--amber-bright); font-si
 .spread-cur { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 8px; }
 .spread-cur .spread-unit { color: var(--text-faint); font-size: 11px; font-weight: 400; }
 
+/* ---------- Crude balance ---------- */
+.bal-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px 12px; margin-top: 6px;
+}
+.bal-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.bal-name {
+  color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bal-val { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.bal-val .bal-unit { color: var(--text-faint); font-size: 10px; font-weight: 400; }
+.bal-sub { font-size: 10px; font-variant-numeric: tabular-nums; color: var(--text-faint); }
+
 /* ---------- Energy hub ---------- */
 .hub-toolbar {
   display: grid; grid-template-columns: minmax(320px, 1fr) minmax(220px, 320px);

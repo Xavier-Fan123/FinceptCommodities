@@ -16,6 +16,7 @@ API:
     /api/energy-chemicals                     energy/petrochemical product map
     /api/energy-chemicals/product/{id}        product context and trade lens
     /api/news[?topic=energy][&product=wti]    public news sources + watch briefs
+    /api/lpg/*                                local licensed/public LPG workspace
 
 Caching: network fetches are cached per (kind, commodity) with TTLs matched to
 how often the data actually changes, plus a stale-while-revalidate window —
@@ -46,6 +47,10 @@ from analytics.positioning import COTAnalyzer  # noqa: E402
 from analytics.risk import CommodityRiskAnalyzer  # noqa: E402
 from analytics.spreads import SpreadAnalyzer  # noqa: E402
 from analytics.inventory import InventoryAnalyzer  # noqa: E402
+from lpg import LpgService  # noqa: E402
+from lpg.exporting import to_csv, to_xlsx  # noqa: E402
+from lpg.refresh_jobs import RefreshBusy, RefreshJobManager  # noqa: E402
+from lpg.workflow import LpgRefreshWorkflow  # noqa: E402
 
 # TTLs matched to source update frequency; swr = extra window where stale data
 # is served immediately while one background thread refreshes it.
@@ -61,6 +66,9 @@ _CACHE = {}          # key -> (fetched_at, value)
 _CACHE_LOCK = threading.Lock()
 _KEY_LOCKS = {}      # key -> Lock, so concurrent misses coalesce into one fetch
 _REFRESHING = set()  # keys with an in-flight background refresh
+
+_LPG_RUNTIME = None
+_LPG_RUNTIME_LOCK = threading.Lock()
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -455,15 +463,71 @@ def _is_fresh(query):
     return (query.get("fresh") or [""])[0] in ("1", "true", "yes")
 
 
+def _lpg_runtime():
+    """Build the LPG database/workflow only when its API is first used."""
+    global _LPG_RUNTIME
+    if _LPG_RUNTIME is None:
+        with _LPG_RUNTIME_LOCK:
+            if _LPG_RUNTIME is None:
+                service = LpgService()
+                workflow = LpgRefreshWorkflow(service=service)
+                jobs = RefreshJobManager(workflow.refresh)
+                _LPG_RUNTIME = (service, workflow, jobs)
+    return _LPG_RUNTIME
+
+
+def _query_value(query, name, default=None):
+    values = query.get(name)
+    if not values:
+        return default
+    value = str(values[0]).strip()
+    return value if value else default
+
+
+def _query_int(query, name, default=None, minimum=0, maximum=5000):
+    raw = _query_value(query, name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw, 10)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"query parameter '{name}' must be an integer") from exc
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"query parameter '{name}' must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _query_fields(query, names):
+    return {
+        name: value
+        for name in names
+        if (value := _query_value(query, name)) is not None
+    }
+
+
+def _entitlement_filter(query, name="entitlement"):
+    value = _query_value(query, name)
+    if value in (None, "all"):
+        return None
+    allowed = {"entitled", "unentitled", "pending_review", "retired", "error"}
+    if value not in allowed:
+        raise ValueError(f"query parameter '{name}' has an invalid entitlement state")
+    return value
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # quiet
         pass
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, str(value))
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -482,10 +546,197 @@ class Handler(BaseHTTPRequestHandler):
         with open(path, "rb") as fh:
             self._send(200, fh.read(), _CONTENT_TYPES.get(ext, "text/plain"))
 
+    def _lpg_error(self, exc):
+        if isinstance(exc, RefreshBusy):
+            return self._json({"error": str(exc), "job": exc.job}, 409)
+        if isinstance(exc, PermissionError):
+            return self._json({"error": str(exc)}, 403)
+        if isinstance(exc, KeyError):
+            message = exc.args[0] if exc.args else str(exc)
+            return self._json({"error": str(message)}, 404)
+        if isinstance(exc, (ValueError, TypeError, json.JSONDecodeError)):
+            return self._json({"error": str(exc)}, 400)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return self._json({"error": str(exc) or "internal server error"}, 500)
+
+    def _lpg_get(self, path, query):
+        try:
+            service, _workflow, jobs = _lpg_runtime()
+
+            if path == "/api/lpg/summary":
+                return self._json(service.summary(as_of=_query_value(query, "as_of")))
+
+            if path == "/api/lpg/series":
+                filters = _query_fields(query, (
+                    "product", "market", "region", "source", "canonical_key",
+                    "quote_kind", "q",
+                ))
+                entitlement = _entitlement_filter(query, "entitlement_state")
+                if entitlement:
+                    filters["entitlement_state"] = entitlement
+                active = _query_value(query, "active")
+                if active is not None:
+                    if active.lower() not in {"0", "1", "true", "false", "yes", "no"}:
+                        raise ValueError("query parameter 'active' must be a boolean")
+                    filters["active"] = active
+                limit = _query_int(query, "limit", minimum=1, maximum=5000)
+                offset = _query_int(query, "offset", minimum=0, maximum=10_000_000)
+                if limit is not None:
+                    filters["limit"] = limit
+                if offset is not None:
+                    filters["offset"] = offset
+                return self._json(service.list_series(filters))
+
+            series_prefix = "/api/lpg/series/"
+            history_suffix = "/history"
+            if path.startswith(series_prefix) and path.endswith(history_suffix):
+                raw_id = path[len(series_prefix):-len(history_suffix)].strip("/")
+                if not raw_id or "/" in raw_id:
+                    raise KeyError("unknown LPG series route")
+                series_id = unquote(raw_id)
+                end = _query_value(query, "end") or _query_value(query, "as_of")
+                limit = _query_int(query, "limit", minimum=1, maximum=5000)
+                payload = service.series_history(
+                    series_id,
+                    start=_query_value(query, "start"),
+                    end=end,
+                    limit=limit,
+                    bate=_query_value(query, "bate"),
+                )
+                return self._json(payload)
+
+            if path == "/api/lpg/curves":
+                return self._json(service.curves(
+                    as_of=_query_value(query, "as_of"),
+                    series_id=_query_value(query, "series_id"),
+                ))
+
+            if path == "/api/lpg/spreads":
+                window = _query_int(
+                    query, "window", default=252, minimum=2, maximum=5000,
+                )
+                return self._json(service.spreads(
+                    as_of=_query_value(query, "as_of"), window=window,
+                ))
+
+            if path == "/api/lpg/news":
+                filters = _query_fields(query, (
+                    "topic", "product", "region", "source", "direction",
+                    "importance", "start", "q",
+                ))
+                end = _query_value(query, "end") or _query_value(query, "as_of")
+                if end:
+                    filters["end"] = end
+                limit = _query_int(query, "limit", minimum=1, maximum=5000)
+                offset = _query_int(query, "offset", minimum=0, maximum=10_000_000)
+                if limit is not None:
+                    filters["limit"] = limit
+                if offset is not None:
+                    filters["offset"] = offset
+                return self._json(service.news(filters))
+
+            if path == "/api/lpg/explorer":
+                dataset = _query_value(query, "dataset", "observations")
+                filters = _query_fields(query, (
+                    "q", "name", "series_id", "start", "end", "as_of",
+                ))
+                entitlement = _entitlement_filter(query)
+                if entitlement:
+                    filters["entitlement"] = entitlement
+                limit = _query_int(query, "limit", minimum=1, maximum=5000)
+                offset = _query_int(query, "offset", minimum=0, maximum=10_000_000)
+                if limit is not None:
+                    filters["limit"] = limit
+                if offset is not None:
+                    filters["offset"] = offset
+                return self._json(service.explorer(dataset=dataset, **filters))
+
+            if path == "/api/lpg/status":
+                job_limit = _query_int(
+                    query, "job_limit", default=20, minimum=1, maximum=50,
+                )
+                payload = service.status()
+                payload["jobs"] = jobs.list(job_limit)
+                payload["active_job"] = jobs.active()
+                return self._json(payload)
+
+            refresh_prefix = "/api/lpg/refresh/"
+            if path.startswith(refresh_prefix):
+                raw_id = path[len(refresh_prefix):].strip("/")
+                if not raw_id or "/" in raw_id:
+                    raise KeyError("unknown LPG refresh job")
+                job = jobs.get(unquote(raw_id))
+                if job is None:
+                    raise KeyError(f"unknown LPG refresh job: {unquote(raw_id)}")
+                return self._json({"job": job})
+
+            if path == "/api/lpg/export":
+                view = _query_value(query, "view", "cockpit").lower()
+                allowed_views = {
+                    "cockpit", "curves", "history", "moc", "news",
+                    "explorer", "status",
+                }
+                if view not in allowed_views:
+                    raise ValueError(f"unsupported LPG export view: {view}")
+                export_format = _query_value(query, "format", "csv").lower()
+                if export_format not in {"csv", "xlsx"}:
+                    raise ValueError("export format must be csv or xlsx")
+                filters = _query_fields(query, (
+                    "as_of", "series_id", "dataset", "q", "name", "start",
+                    "end", "bate", "topic", "product", "region", "source",
+                    "direction", "importance",
+                ))
+                entitlement = _entitlement_filter(query)
+                if entitlement:
+                    filters["entitlement"] = entitlement
+                filters["limit"] = _query_int(
+                    query, "limit", default=5000, minimum=1, maximum=5000,
+                )
+                filters["offset"] = _query_int(
+                    query, "offset", default=0, minimum=0, maximum=10_000_000,
+                )
+                rows = service.export_rows(view, **filters)
+                filename = f"fincept-lpg-{view}.{export_format}"
+                headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+                if export_format == "xlsx":
+                    body = to_xlsx(rows, sheet_name=f"LPG {view.title()}")
+                    ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                else:
+                    body = to_csv(rows)
+                    ctype = "text/csv; charset=utf-8"
+                return self._send(200, body, ctype, headers=headers)
+
+            return self._json({"error": "not found"}, 404)
+        except Exception as exc:  # noqa: BLE001 - local API boundary
+            return self._lpg_error(exc)
+
+    def _read_json_body(self, maximum=65_536):
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length, 10)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > maximum:
+            raise ValueError(f"JSON request body must be at most {maximum} bytes")
+        if length == 0:
+            return {}
+        try:
+            body = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON request body must be UTF-8") from exc
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("JSON request body must be an object")
+        return payload
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        query = parse_qs(parsed.query)
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=100)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, 400)
         try:
             if path in ("/", "/index.html"):
                 return self._file("web/index.html")
@@ -493,6 +744,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file("web/" + path.lstrip("/"))
             if path in ("/ENERGY.md", "/README.md"):
                 return self._file(path.lstrip("/"))
+            if path.startswith("/api/lpg/"):
+                return self._lpg_get(path, query)
             if path == "/api/overview":
                 sector = (query.get("sector") or [None])[0]
                 return self._json(overview_payload(sector, _is_fresh(query)))
@@ -533,6 +786,21 @@ class Handler(BaseHTTPRequestHandler):
             import traceback
             traceback.print_exc(file=sys.stderr)
             self._json({"error": str(exc)}, 500)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/lpg/refresh":
+            return self._json({"error": "not found"}, 404)
+        try:
+            payload = self._read_json_body()
+            scope = payload.get("scope", "all")
+            if not isinstance(scope, str):
+                raise ValueError("refresh scope must be a string")
+            _service, _workflow, jobs = _lpg_runtime()
+            job = jobs.start(scope.strip().lower() or "all")
+            return self._json({"job": job}, 202)
+        except Exception as exc:  # noqa: BLE001 - local API boundary
+            return self._lpg_error(exc)
 
 
 def _warm_up():

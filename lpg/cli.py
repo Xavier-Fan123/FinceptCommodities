@@ -1,0 +1,92 @@
+"""Command-line entry point for the private LPG ingestion workflow."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from .platts_excel import (
+    build_probe_workbook,
+    build_scope_workbooks,
+    parse_workbook,
+    write_staging,
+)
+from .service import LpgService
+from .workflow import LpgRefreshWorkflow
+
+
+def _print(payload: Any) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Fincept LPG licensed-data workflow")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    build = sub.add_parser("build", help="build private daily Add-in workbooks")
+    build.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    build.add_argument("--force", action="store_true")
+
+    probe = sub.add_parser("build-probe", help="build one live Add-in validation formula")
+    probe.add_argument("--symbol", default="PMAAV00")
+
+    refresh = sub.add_parser("refresh", help="refresh Excel, stage, and import")
+    refresh.add_argument("--scope", choices=("asia", "overnight", "all", "news"), default="all")
+    refresh.add_argument("--timeout", type=int, default=240)
+
+    parse = sub.add_parser("parse", help="parse an already-saved Add-in workbook")
+    parse.add_argument("workbook", type=Path)
+    parse.add_argument("--no-import", action="store_true")
+
+    ingest = sub.add_parser("import", help="import an atomic staging JSON file")
+    ingest.add_argument("staging", type=Path)
+
+    backfill = sub.add_parser("build-backfill", help="build resumable yearly backfill workbooks")
+    backfill.add_argument("--start-year", type=int, required=True)
+    backfill.add_argument("--end-year", type=int, required=True)
+    backfill.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    backfill.add_argument("--force", action="store_true")
+
+    sub.add_parser("status", help="show the local entitlement and source-health matrix")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    service = LpgService()
+    workflow = LpgRefreshWorkflow(service=service)
+    if args.command == "build":
+        paths = build_scope_workbooks(scope=args.scope, force=args.force)
+        payload = {"state": "succeeded", "workbooks": [str(path) for path in paths]}
+    elif args.command == "build-probe":
+        path = build_probe_workbook(symbol=args.symbol, force=True)
+        payload = {"state": "succeeded", "workbook": str(path), "symbol": args.symbol.upper()}
+    elif args.command == "refresh":
+        payload = workflow.refresh(args.scope, timeout_seconds=args.timeout)
+    elif args.command == "parse":
+        parsed = parse_workbook(args.workbook)
+        staged = write_staging(parsed)
+        payload = {"parsed": {"status": parsed.get("status"),
+                              "records": len(parsed.get("records") or []),
+                              "entitlements": len(parsed.get("entitlement_results") or [])},
+                   "staging": str(staged) if staged else None}
+        if staged and not args.no_import:
+            payload["import"] = service.import_platts_staging(staged)
+    elif args.command == "import":
+        payload = service.import_platts_staging(args.staging)
+    elif args.command == "build-backfill":
+        payload = workflow.build_backfill(
+            args.start_year, args.end_year, scope=args.scope, force=args.force,
+        )
+    else:
+        payload = service.status()
+    _print(payload)
+    state = str(payload.get("state") or payload.get("status") or "succeeded")
+    return 0 if state in {"succeeded", "success", "partial", "deferred"} else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

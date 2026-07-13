@@ -1,0 +1,6 @@
+numpy>=1.26
+openpyxl>=3.1
+pandas>=2.0
+requests>=2.31
+scipy>=1.11
+yfinance>=0.2.40

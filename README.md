@@ -1,9 +1,11 @@
 # Fincept Commodities — Local Dashboard
 
-A fast, **fully local** commodities dashboard. It runs in your browser, talks
-only to **free public data APIs** (Yahoo Finance + CFTC), and has **no login,
-no backend, and no dependency on the FinceptTerminal app**. Built to give the
-commodity views a clean, snappy presentation without the heavy Qt/Chromium app.
+A fast, **localhost-only** commodities dashboard with a dedicated LPG trader
+workspace. Public screens use Yahoo Finance, CFTC, EIA, and RSS feeds. The LPG
+workspace can additionally ingest licensed S&P Global Commodity Insights data
+through the official Excel Add-in and, when separately entitled, a contracted
+machine-readable news API. Licensed files remain in a Git-ignored private data
+directory and are never served outside `127.0.0.1`.
 
 ## Run
 
@@ -16,7 +18,35 @@ Double-click **`start.bat`**, or from a terminal:
 It opens `http://127.0.0.1:8848/` automatically. Pass a port to change it:
 `start.bat 9000`. Stop with Ctrl+C.
 
+Install the declared dependencies when not using the bundled FinceptTerminal
+Python environment:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
 ## What you get
+
+**LPG Trader Cockpit** — a first-class seven-view workspace for an Asia-focused
+LPG trader:
+
+- **Cockpit** — entitled FEI/CP/Mont Belvieu/freight assessments, source
+  freshness, FEI-CP, P/B, FEI-MOPJ, and freight-adjusted arb signals.
+- **Curves & Spreads** — forward curves and derived spreads with unit checks.
+- **History & Seasonality** — long history, statistics, monthly returns,
+  seasonal bands, BATE selection, and correction counts.
+- **MOC & Fundamentals** — entitlement-aware eWindow/MOC and dataset rows.
+- **News** — official API content when separately configured, plus clearly
+  labelled public fallback news and trader tags.
+- **Data Explorer** — filtered series, observations, curves, revisions,
+  candidates, news, spreads, and ingestion runs.
+- **Data Status** — the complete entitlement matrix, source/session health,
+  refresh jobs, coverage dates, and failure reasons.
+
+Price data is never silently substituted. Derived spreads require compatible
+currency/UOM. Daily legs must share an effective date; FEI-CP uses explicit
+contract-month alignment. A stale/missing leg blocks the result instead of
+combining mismatched assessments.
 
 **Overview** — all 23 commodities grouped by sector (Energy, Precious/Base
 Metals, Grains, Softs, Livestock) with live last price, change, %change, and
@@ -83,9 +113,12 @@ locally and instantly.
 server.py        stdlib http.server (no Flask) + layered TTL cache
 sources.py       compact fetchers — yfinance (quotes/history/curve) + CFTC (COT)
 energy_chemicals.py  Energy Hub product map + key-less news aggregation
+lpg/             private SQLite store, catalog, analytics, Excel staging,
+                 news adapters, refresh jobs, exports, workflow, and CLI
 analytics/       the tested commodity analytics (term structure, risk,
                  seasonality, positioning, spreads, …), self-contained
 web/             index.html · style.css · app.js (the dashboard UI)
+scripts/         official Add-in refresh and Windows Task Scheduler helpers
 ENERGY.md        energy-commodities primer (served at /ENERGY.md)
 start.bat        launcher (points at the venv Python)
 ```
@@ -100,7 +133,75 @@ API (all JSON, all local):
 /api/energy-chemicals
 /api/energy-chemicals/product/{id}
 /api/news[?topic=energy][&product=wti][&limit=50]
+/api/lpg/summary[?as_of=YYYY-MM-DD]
+/api/lpg/series
+/api/lpg/series/{id}/history
+/api/lpg/curves
+/api/lpg/spreads
+/api/lpg/news
+/api/lpg/explorer
+/api/lpg/status
+/api/lpg/refresh/{job_id}
+/api/lpg/export?view=...&format=csv|xlsx
 ```
+
+`POST /api/lpg/refresh` starts a single-flight asynchronous job with scope
+`asia`, `overnight`, `news`, or `all`. A second refresh receives HTTP 409 with
+the active job rather than starting another Excel instance.
+
+## Licensed LPG setup
+
+The workflow uses the signed-in official Excel Add-in session; it never stores
+an interactive username or password.
+
+```powershell
+# Build private, isolated-query workbooks (Git ignored)
+python -m lpg.cli build --scope all
+
+# Open one workbook once and sign in from the S&P Global Energy ribbon.
+# Then run discovery + refresh + atomic staging + SQLite import:
+python -m lpg.cli refresh --scope asia
+python -m lpg.cli refresh --scope overnight
+
+# Inspect the entitlement/source matrix
+python -m lpg.cli status
+```
+
+Private artifacts are under `data/private/platts/` and
+`data/private/lpg.sqlite`. Each symbol/curve is queried independently, so one
+unentitled code cannot invalidate an entitled batch. A failed/expired Excel
+session does not replace the last-good staging file or observations.
+Generated workbooks use manual calculation and the refresh runner dispatches
+each isolated Add-in formula once; this prevents volatile async UDFs from
+repeating completed requests. Current prices, history, forward curves, eWindow,
+and news are separate entitlements, and unavailable datasets stay visibly empty
+rather than being estimated or synthesized.
+
+Yearly backfill workbooks are resumable and built explicitly:
+
+```powershell
+python -m lpg.cli build-backfill --start-year 2021 --end-year 2026 --scope all
+```
+
+Review scheduler configuration without changing Windows:
+
+```powershell
+powershell -File scripts\Install-LpgScheduledTasks.ps1 -DryRun
+```
+
+Install only after the dry run is correct. The tasks run for the interactive
+user at 08:00 (overnight/US legs) and 17:30 Singapore time (Asia close). If
+Excel is open, the refresh defers without taking focus; the trigger retries
+every 15 minutes for up to two hours.
+
+```powershell
+powershell -File scripts\Install-LpgScheduledTasks.ps1 -Install
+```
+
+Machine-readable Platts news is a separate entitlement from Excel. Copy
+`.env.example` to a private `.env` and populate only the endpoint/OAuth fields
+supplied with the API contract. When it is not configured, the system reports
+the gap and uses public LPG news; it does not scrape Platts Connect.
 
 Append `&fresh=1` (or `?fresh=1`) to bypass the cache — the ↻ button does
 this for the active view.
@@ -111,7 +212,7 @@ with a stale-while-revalidate window (stale data is served instantly while
 one background thread refreshes), per-key request coalescing, and a startup
 warm-up so the first page paint hits a warm cache.
 
-Data sources, all free:
+Public data sources:
 - **Yahoo Finance** (key-less) — continuous-contract quotes/history and dated
   contracts (e.g. `CLN26.NYM`) for building the futures curve
 - **Public news feeds** (key-less) - Google News RSS, Yahoo Finance RSS, and
@@ -124,6 +225,13 @@ Data sources, all free:
   working gas `NW2_EPG0_SWO_R48_BCF`; plus the WTI crude balance from the
   weekly supply route (`petroleum/sum/sndw`): Cushing stocks, SPR, production,
   refinery runs, utilization, and crude imports/exports
+
+Optional licensed sources:
+
+- **S&P Global Energy Excel Add-in** — entitled LPG assessments, history,
+  corrections, forward curves, discovery metadata, and eWindow datasets.
+- **S&P Global machine-readable news API** — only when a separate API contract
+  and client credentials are configured locally.
 
 ## Notes
 
@@ -142,6 +250,9 @@ Data sources, all free:
   process-level `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` settings. This keeps
   the dashboard working on machines where those variables point to a dead local
   proxy such as `127.0.0.1:9`.
+- **Private/licensed data:** `.env`, `data/private/`, and `data/exports/` are
+  excluded from Git. Do not remove these rules or publish SQLite/workbook
+  contents, entitlement results, news bodies, tokens, or credentials.
 - This folder is independent of `C:\Program Files\FinceptTerminal` — it keeps
   working even if that app is uninstalled (as long as the chosen Python has
   the packages above).

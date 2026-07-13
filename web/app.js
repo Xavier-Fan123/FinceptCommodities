@@ -5,6 +5,15 @@ const SECTOR_LABEL = {
   grains: "Grains", softs: "Softs", livestock: "Livestock",
 };
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const LPG_VIEWS = [
+  { id: "cockpit", label: "Cockpit" },
+  { id: "curves", label: "Curves & Spreads" },
+  { id: "history", label: "History & Seasonality" },
+  { id: "moc", label: "MOC & Fundamentals" },
+  { id: "news", label: "News" },
+  { id: "explorer", label: "Data Explorer" },
+  { id: "status", label: "Data Status" },
+];
 
 const CARD_TITLES = {
   price: "Price · 1Y",
@@ -51,6 +60,17 @@ let state = {
   newsProduct: null,
   newsData: null,
   newsFilter: "",
+  lpgView: "cockpit",
+  lpgAsOf: "",
+  lpgData: {},
+  lpgRequestToken: 0,
+  lpgSeriesId: null,
+  lpgSeriesQuery: "",
+  lpgMocDataset: "eWMD",
+  lpgNewsFilter: { query: "", region: "all", product: "all", direction: "all" },
+  lpgExplorer: { dataset: "series", query: "", entitlement: "all", offset: 0, limit: 100 },
+  lpgRefreshTimer: null,
+  lpgRefreshJob: null,
 };
 
 // ---------- helpers ----------
@@ -60,6 +80,7 @@ const el = (tag, attrs = {}, children = []) => {
   const node = document.createElementNS(attrs.ns || "http://www.w3.org/1999/xhtml", tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "ns") continue;
+    if (v === null || v === undefined || v === false) continue;
     if (k === "class") node.setAttribute("class", v);
     else if (k === "text") node.textContent = v;
     else if (k === "html") node.innerHTML = v;
@@ -95,10 +116,25 @@ async function fetchJSON(url) {
   return res.json();
 }
 
+async function requestJSON(url, options = {}) {
+  const res = await fetch(url, options);
+  if (!res.ok) {
+    let msg = "HTTP " + res.status;
+    try {
+      const body = await res.json();
+      if (body && (body.error || body.detail)) msg = body.error || body.detail;
+    } catch (e) { /* keep status */ }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 // ---------- routing ----------
 function route() {
   const h = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
-  if (h === "spreads") showSpreadsView();
+  const routeParts = h.split("/").filter(Boolean);
+  if (routeParts[0] === "lpg") showLpgView(routeParts[1] || "cockpit");
+  else if (h === "spreads") showSpreadsView();
   else if (h === "energy-hub") showEnergyHubView();
   else if (h === "news") showNewsView();
   else if (h) showDetail(h.toLowerCase());
@@ -106,7 +142,7 @@ function route() {
 }
 
 function swapViews(name) {
-  for (const id of ["overview", "detail", "spreads", "energy-hub", "news"]) {
+  for (const id of ["overview", "detail", "spreads", "energy-hub", "news", "lpg"]) {
     byId(id).classList.toggle("hidden", id !== name);
   }
   window.scrollTo(0, 0);
@@ -154,6 +190,18 @@ function showNewsView() {
   loadNews(false);
 }
 
+function showLpgView(view) {
+  const next = LPG_VIEWS.some(item => item.id === view) ? view : "cockpit";
+  state.view = "lpg";
+  state.detailId = null;
+  state.lpgView = next;
+  swapViews("lpg");
+  document.title = `${LPG_VIEWS.find(item => item.id === next).label} - LPG - Fincept Commodities`;
+  setActiveTab("lpg");
+  renderLpgShell();
+  loadLpgView(next);
+}
+
 // ---------- overview ----------
 async function loadOverview(fresh = false) {
   const loading = $("#ov-loading");
@@ -180,12 +228,11 @@ async function loadOverview(fresh = false) {
 
 function renderTabs(sectors) {
   const tabs = $("#tabs");
-  if (tabs.dataset.built) return;
-  tabs.dataset.built = "1";
+  tabs.replaceChildren();
   const mk = (key, label) => {
     const b = el("button", { text: label, "data-tab": key });
     b.onclick = () => {
-      if (key === "spreads" || key === "energy-hub" || key === "news") {
+      if (key === "spreads" || key === "energy-hub" || key === "news" || key === "lpg") {
         if (key === "news") {
           state.newsProduct = null;
           state.newsAt = 0;
@@ -201,6 +248,7 @@ function renderTabs(sectors) {
   };
   tabs.appendChild(mk("all", "All"));
   sectors.forEach(s => tabs.appendChild(mk(s, SECTOR_LABEL[s] || s)));
+  tabs.appendChild(mk("lpg", "LPG"));
   tabs.appendChild(mk("energy-hub", "Energy Hub"));
   tabs.appendChild(mk("news", "News"));
   tabs.appendChild(mk("spreads", "Spreads"));
@@ -1099,6 +1147,947 @@ function ageStr(ts) {
   return `${Math.round(diff / 86400)}d`;
 }
 
+// ---------- LPG trader workspace ----------
+function lpgPayload(data) {
+  if (data && data.data && typeof data.data === "object" && !Array.isArray(data.data)) return data.data;
+  return data || {};
+}
+
+function lpgList(data, keys) {
+  if (Array.isArray(data)) return data;
+  const src = lpgPayload(data);
+  for (const key of keys) if (Array.isArray(src[key])) return src[key];
+  return [];
+}
+
+function lpgValue(obj, ...keys) {
+  for (const key of keys) {
+    if (obj && obj[key] !== null && obj[key] !== undefined && obj[key] !== "") return obj[key];
+  }
+  return null;
+}
+
+function lpgNumber(value, digits = 2) {
+  const num = Number(value);
+  if (value === null || value === undefined || value === "" || !Number.isFinite(num)) return "N/A";
+  return num.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function lpgDate(value, withTime = false) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  let raw = value;
+  if (typeof raw === "number" && raw < 1e12) raw *= 1000;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return withTime
+    ? d.toLocaleString("en-SG", { hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleDateString("en-CA");
+}
+
+function lpgStateInfo(value, stale = false) {
+  const key = String(value || "unknown").toLowerCase().replace(/[\s-]+/g, "_");
+  if (stale || key.includes("stale")) return { cls: "stale", label: "Stale / 已过期" };
+  if (["entitled", "active", "ok", "success", "succeeded", "completed", "available", "fresh", "configured"].includes(key)) {
+    return { cls: "ok", label: key === "entitled" ? "Entitled / 已授权" : "Active / 正常" };
+  }
+  if (["unentitled", "denied", "forbidden", "unauthorized", "retired"].includes(key)) {
+    return { cls: "bad", label: key === "retired" ? "Retired / 已停用" : "Unentitled / 未授权" };
+  }
+  if (["pending", "pending_review", "queued", "running", "in_progress", "partial", "deferred", "no_data", "not_configured"].includes(key)) {
+    if (key === "partial") return { cls: "warn", label: "Partial / 部分完成" };
+    if (key === "deferred") return { cls: "warn", label: "Deferred / 已延后" };
+    if (key === "no_data") return { cls: "warn", label: "No data / 暂无数据" };
+    if (key === "not_configured") return { cls: "warn", label: "Not configured / 未配置" };
+    return { cls: "warn", label: key.includes("pending") ? "Pending / 待确认" : "Running / 刷新中" };
+  }
+  if (["error", "failed", "degraded", "blocked"].includes(key)) return { cls: "bad", label: "Error / 异常" };
+  return { cls: "neutral", label: value ? String(value) : "Unknown / 未知" };
+}
+
+function lpgBadge(value, stale = false, title = "") {
+  const info = lpgStateInfo(value, stale);
+  return el("span", { class: `lpg-badge ${info.cls}`, text: info.label, title });
+}
+
+function lpgIsStale(item) {
+  if (!item) return false;
+  if (item.stale === true || item.is_stale === true) return true;
+  const freshness = item.freshness;
+  if (typeof freshness === "string") return freshness.toLowerCase().includes("stale");
+  if (freshness && typeof freshness === "object") {
+    return freshness.stale === true || String(freshness.status || "").toLowerCase().includes("stale");
+  }
+  return false;
+}
+
+function lpgEntitlement(item) {
+  return lpgValue(item, "entitlement_state", "entitlement", "access_status", "status") || "unknown";
+}
+
+function lpgIsActive(item) {
+  const value = item && item.active;
+  return value !== false && value !== 0 && String(value).toLowerCase() !== "false";
+}
+
+function lpgSeriesAllowed(series) {
+  return String(lpgEntitlement(series)).toLowerCase() === "entitled" && lpgIsActive(series);
+}
+
+function lpgNewsAllowed(article) {
+  const stateName = String(lpgEntitlement(article)).toLowerCase();
+  return ["entitled", "public"].includes(stateName) && lpgIsActive(article);
+}
+
+function lpgSeriesKey(item) {
+  const value = lpgValue(item, "series_id", "id");
+  return value === null ? "" : String(value);
+}
+
+function lpgAllowedSeriesIds(catalog) {
+  return new Set(lpgList(catalog || {}, ["items", "series"]).filter(lpgSeriesAllowed).map(lpgSeriesKey).filter(Boolean));
+}
+
+function lpgEmpty(title, detail = "") {
+  const box = el("div", { class: "lpg-empty" }, [
+    el("strong", { text: title }),
+  ]);
+  if (detail) box.appendChild(el("span", { text: detail }));
+  return box;
+}
+
+function lpgSection(title, meta, children, cls = "") {
+  const head = el("div", { class: "lpg-section-head" }, [el("h3", { text: title })]);
+  if (meta) head.appendChild(el("span", { class: "meta", text: meta }));
+  return el("section", { class: `lpg-section ${cls}`.trim() }, [head, ...[].concat(children || []).filter(Boolean)]);
+}
+
+function lpgTable(columns, rows, options = {}) {
+  if (!rows.length) return lpgEmpty(options.empty || "No data / 暂无数据", options.detail || "");
+  const table = el("table", { class: "lpg-table" });
+  const headRow = el("tr");
+  for (const col of columns) headRow.appendChild(el("th", { class: col.class || "", text: col.label }));
+  table.appendChild(el("thead", {}, headRow));
+  const body = el("tbody");
+  for (const row of rows) {
+    const clickable = Boolean(options.onRow && (!options.isRowClickable || options.isRowClickable(row)));
+    const tr = el("tr", clickable ? { tabindex: "0", class: "lpg-clickable" } : {});
+    for (const col of columns) {
+      const value = col.render ? col.render(row) : lpgValue(row, col.key);
+      const td = el("td", { class: col.class || "" });
+      if (value instanceof Node) td.appendChild(value);
+      else td.textContent = value === null || value === undefined || value === "" ? "N/A" : String(value);
+      tr.appendChild(td);
+    }
+    if (clickable) {
+      const open = () => options.onRow(row);
+      tr.onclick = open;
+      tr.onkeydown = event => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+      };
+    }
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+  return el("div", { class: "lpg-table-wrap" }, table);
+}
+
+function lpgGenericTable(data, options = {}) {
+  const src = lpgPayload(data);
+  const rawColumns = options.columns || src.columns || [];
+  let rows = options.rows || src.rows || [];
+  let keys = rawColumns.map(col => typeof col === "string" ? col : (col.key || col.name || col.id)).filter(Boolean);
+  if (!keys.length && rows.length && !Array.isArray(rows[0])) keys = Object.keys(rows[0]);
+  if (rows.length && Array.isArray(rows[0])) {
+    rows = rows.map(values => Object.fromEntries(keys.map((key, index) => [key, values[index]])));
+  }
+  const columns = keys.map((key, index) => {
+    const def = rawColumns[index];
+    const label = typeof def === "object" && def ? (def.label || def.title || key) : key;
+    return { key, label: String(label).replace(/_/g, " "), render: row => lpgGenericValue(row[key]) };
+  });
+  return lpgTable(columns, rows, { empty: options.empty || "No rows / 暂无记录" });
+}
+
+function lpgGenericValue(value) {
+  if (value === null || value === undefined || value === "") return "N/A";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "number") return value.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  if (typeof value === "object") {
+    const text = JSON.stringify(value);
+    return text.length > 180 ? text.slice(0, 177) + "..." : text;
+  }
+  return String(value);
+}
+
+function renderLpgShell() {
+  const tabs = byId("lpg-tabs");
+  const buttons = LPG_VIEWS.map(item => {
+    const button = el("button", {
+      id: `lpg-tab-${item.id}`,
+      type: "button",
+      role: "tab",
+      text: item.label,
+      tabindex: item.id === state.lpgView ? "0" : "-1",
+      "aria-controls": "lpg-body",
+      "aria-selected": String(item.id === state.lpgView),
+      class: item.id === state.lpgView ? "active" : "",
+    });
+    button.onclick = () => { location.hash = item.id === "cockpit" ? "#/lpg" : `#/lpg/${item.id}`; };
+    return button;
+  });
+  tabs.replaceChildren(...buttons);
+  buttons.forEach((button, index) => {
+    button.onkeydown = event => {
+      let next = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % buttons.length;
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index - 1 + buttons.length) % buttons.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = buttons.length - 1;
+      if (next === null) return;
+      event.preventDefault();
+      buttons[next].focus();
+      buttons[next].click();
+    };
+  });
+  const body = byId("lpg-body");
+  body.setAttribute("aria-labelledby", `lpg-tab-${state.lpgView}`);
+
+  const asOf = el("input", { type: "date", value: state.lpgAsOf, "aria-label": "LPG as-of date", title: "As-of date / 估值日期" });
+  asOf.onchange = event => {
+    state.lpgAsOf = event.target.value || "";
+    state.lpgData = {};
+    loadLpgView(state.lpgView);
+    updateLpgExportLinks();
+  };
+  const scope = el("select", { id: "lpg-refresh-scope", "aria-label": "LPG refresh scope", title: "Refresh scope / 刷新范围" }, [
+    el("option", { value: "all", text: "All sources" }),
+    el("option", { value: "asia", text: "Asia close" }),
+    el("option", { value: "overnight", text: "Overnight / US" }),
+  ]);
+  const refresh = el("button", { id: "lpg-refresh", type: "button", class: "lpg-command", text: "Refresh", title: "Start LPG source refresh / 启动数据刷新" });
+  refresh.onclick = () => startLpgRefresh(scope.value);
+  const csv = el("a", { id: "lpg-export-csv", class: "lpg-export", text: "CSV", title: "Export current LPG view as CSV" });
+  const xlsx = el("a", { id: "lpg-export-xlsx", class: "lpg-export", text: "XLSX", title: "Export current LPG view as XLSX" });
+  const job = el("span", {
+    id: "lpg-refresh-state",
+    class: "lpg-job-state",
+    text: state.lpgRefreshJob ? (state.lpgRefreshJob.label || "Refresh running / 刷新中") : "",
+  });
+  byId("lpg-actions").replaceChildren(
+    el("label", { class: "lpg-field", text: "As of" }, asOf),
+    scope,
+    refresh,
+    el("span", { class: "lpg-export-group" }, [csv, xlsx]),
+    job,
+  );
+  updateLpgExportLinks();
+}
+
+function updateLpgExportLinks() {
+  const query = new URLSearchParams({ view: state.lpgView });
+  if (state.lpgAsOf) query.set("as_of", state.lpgAsOf);
+  if (state.lpgView === "history" && state.lpgSeriesId) query.set("series_id", state.lpgSeriesId);
+  if (state.lpgView === "moc") query.set("dataset", state.lpgMocDataset);
+  if (state.lpgView === "explorer") {
+    query.set("dataset", state.lpgExplorer.dataset);
+    if (state.lpgExplorer.query) query.set("q", state.lpgExplorer.query);
+    if (state.lpgExplorer.entitlement !== "all") query.set("entitlement", state.lpgExplorer.entitlement);
+  }
+  if (state.lpgView === "news") {
+    const filter = state.lpgNewsFilter;
+    if (filter.query) query.set("q", filter.query);
+    for (const key of ["region", "product", "direction"]) {
+      if (filter[key] && filter[key] !== "all") query.set(key, filter[key]);
+    }
+  }
+  const csv = byId("lpg-export-csv"), xlsx = byId("lpg-export-xlsx");
+  if (csv) csv.href = `/api/lpg/export?${query.toString()}&format=csv`;
+  if (xlsx) xlsx.href = `/api/lpg/export?${query.toString()}&format=xlsx`;
+}
+
+function lpgApiUrl(path, params = {}, options = {}) {
+  const query = new URLSearchParams();
+  const asOfParam = Object.prototype.hasOwnProperty.call(options, "asOf") ? options.asOf : "as_of";
+  if (state.lpgAsOf && asOfParam) query.set(asOfParam, state.lpgAsOf);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined && value !== "") query.set(key, value);
+  }
+  const qs = query.toString();
+  return `/api/lpg/${path}${qs ? "?" + qs : ""}`;
+}
+
+function lpgEntitledCatalogUrl() {
+  return lpgApiUrl("series", { entitlement_state: "entitled", active: "1", limit: 5000 }, { asOf: null });
+}
+
+function lpgExplorerAsOfParam(dataset) {
+  return ["observations", "curves", "news", "dataset_rows"].includes(dataset) ? "end" : null;
+}
+
+async function loadLpgView(view) {
+  if (view === "history") return loadLpgHistory();
+  const token = ++state.lpgRequestToken;
+  const body = byId("lpg-body");
+  body.replaceChildren(el("div", { class: "loading", text: "Loading LPG data / 正在加载..." }));
+  byId("refresh").classList.add("spin");
+  try {
+    let payload;
+    if (view === "cockpit") {
+      const [summary, catalog] = await Promise.all([
+        fetchJSON(lpgApiUrl("summary")), fetchJSON(lpgEntitledCatalogUrl()),
+      ]);
+      payload = { ...lpgPayload(summary), access_catalog: lpgPayload(catalog) };
+    }
+    else if (view === "curves") {
+      const [curves, spreads, catalog] = await Promise.all([
+        fetchJSON(lpgApiUrl("curves")), fetchJSON(lpgApiUrl("spreads")), fetchJSON(lpgEntitledCatalogUrl()),
+      ]);
+      payload = { curves: lpgPayload(curves), spreads: lpgPayload(spreads), access_catalog: lpgPayload(catalog) };
+    } else if (view === "moc") {
+      const [data, catalog] = await Promise.all([
+        fetchJSON(lpgApiUrl("explorer", { dataset: state.lpgMocDataset }, { asOf: "end" })),
+        fetchJSON(lpgEntitledCatalogUrl()),
+      ]);
+      payload = { ...lpgPayload(data), access_catalog: lpgPayload(catalog) };
+    }
+    else if (view === "news") payload = await fetchJSON(lpgApiUrl("news", {}, { asOf: "end" }));
+    else if (view === "explorer") {
+      const request = fetchJSON(lpgApiUrl("explorer", {
+        dataset: state.lpgExplorer.dataset,
+        q: state.lpgExplorer.query,
+        entitlement: state.lpgExplorer.entitlement === "all" ? "" : state.lpgExplorer.entitlement,
+        offset: state.lpgExplorer.offset,
+        limit: state.lpgExplorer.limit,
+      }, { asOf: lpgExplorerAsOfParam(state.lpgExplorer.dataset) }));
+      const needsCatalog = ["observations", "curves", "revisions"].includes(state.lpgExplorer.dataset);
+      const [data, catalog] = await Promise.all([request, needsCatalog ? fetchJSON(lpgEntitledCatalogUrl()) : Promise.resolve(null)]);
+      payload = { ...lpgPayload(data), access_catalog: catalog ? lpgPayload(catalog) : null };
+    } else payload = await fetchJSON(lpgApiUrl("status", {}, { asOf: null }));
+    if (token !== state.lpgRequestToken || state.view !== "lpg" || state.lpgView !== view) return;
+    state.lpgData[view] = lpgPayload(payload);
+    if (view === "cockpit") renderLpgCockpit(state.lpgData[view]);
+    else if (view === "curves") renderLpgCurves(state.lpgData[view]);
+    else if (view === "moc") renderLpgMoc(state.lpgData[view]);
+    else if (view === "news") renderLpgNews(state.lpgData[view]);
+    else if (view === "explorer") renderLpgExplorer(state.lpgData[view]);
+    else renderLpgStatus(state.lpgData[view]);
+    updateLpgMeta(state.lpgData[view]);
+  } catch (error) {
+    if (token !== state.lpgRequestToken) return;
+    body.replaceChildren(lpgEmpty("LPG data unavailable / 数据暂不可用", error.message));
+    byId("lpg-meta").textContent = `Load error / 加载失败: ${error.message}`;
+  } finally {
+    if (token === state.lpgRequestToken && !(state.lpgRefreshJob && state.lpgRefreshJob.running)) byId("refresh").classList.remove("spin");
+  }
+}
+
+function updateLpgMeta(data) {
+  const src = data && data.curves ? data.curves : lpgPayload(data);
+  const asOf = lpgValue(src, "as_of", "observation_date");
+  const updated = lpgValue(src, "updated_at", "updated", "fetched_at");
+  const bits = [];
+  if (asOf) bits.push(`As of ${lpgDate(asOf)}`);
+  if (updated) bits.push(`Updated ${lpgDate(updated, true)}`);
+  byId("lpg-meta").textContent = bits.length ? bits.join(" | ") : "Platts entitlement-aware workspace";
+  if (updated) byId("updated").textContent = "updated " + lpgDate(updated, true);
+}
+
+function lpgPriceMetric(price) {
+  const name = lpgValue(price, "name", "canonical_key", "symbol", "series_id") || "LPG series";
+  const value = lpgValue(price, "value", "price", "last");
+  const unit = [price.currency, price.unit].filter(Boolean).join("/");
+  const button = el("button", {
+    type: "button",
+    class: "lpg-metric",
+    title: price.series_id ? "Open history / 查看历史" : name,
+  }, [
+    el("span", { class: "lpg-metric-label", text: name }),
+    el("span", { class: "lpg-metric-value", text: `${lpgNumber(value, Math.abs(Number(value)) < 10 ? 3 : 2)}${unit ? " " + unit : ""}` }),
+    el("span", { class: "lpg-metric-meta", text: `${lpgDate(lpgValue(price, "observation_date", "date"))} | ${price.source || "source N/A"}` }),
+    lpgBadge(lpgEntitlement(price), lpgIsStale(price)),
+  ]);
+  if (price.series_id || price.id) {
+    button.onclick = () => {
+      state.lpgSeriesId = price.series_id || price.id;
+      location.hash = "#/lpg/history";
+    };
+  } else button.disabled = true;
+  return button;
+}
+
+function lpgSpreadColumns() {
+  return [
+    { label: "Spread", render: row => lpgValue(row, "name", "id") },
+    { label: "Value", class: "num", render: row => row.success === false ? "Blocked" : `${lpgNumber(lpgValue(row, "value", "spread"), 2)} ${[row.currency, row.unit].filter(Boolean).join("/")}`.trim() },
+    { label: "As of", render: row => lpgDate(lpgValue(row, "observation_date", "date", "as_of")) },
+    { label: "Z-score", class: "num", render: row => lpgNumber(row.zscore, 2) },
+    { label: "Percentile", class: "num", render: row => row.percentile === null || row.percentile === undefined ? "N/A" : `${lpgNumber(Number(row.percentile) <= 1 ? Number(row.percentile) * 100 : row.percentile, 0)}%` },
+    { label: "Legs / State", render: row => row.blocked_reason ? `Blocked / 已阻断: ${row.blocked_reason}` : `${(row.legs || []).length} legs | Matched / 日期已对齐` },
+  ];
+}
+
+function lpgSpreadAllowed(row, allowedIds) {
+  if (row.success === false) return true;
+  const legs = Array.isArray(row.legs) ? row.legs : [];
+  return legs.length > 0 && legs.every(leg => {
+    const id = lpgSeriesKey(leg);
+    return id && allowedIds.has(id);
+  });
+}
+
+function renderLpgCockpit(data) {
+  const allowedIds = lpgAllowedSeriesIds(data.access_catalog);
+  const prices = lpgList(data, ["prices", "benchmarks", "items"])
+    .filter(price => lpgSeriesAllowed(price) && allowedIds.has(lpgSeriesKey(price)));
+  const spreads = lpgList(data, ["spreads"]).filter(row => lpgSpreadAllowed(row, allowedIds));
+  const sources = lpgList(data, ["source_status", "sources"]);
+  const body = byId("lpg-body");
+  const priceGrid = prices.length
+    ? el("div", { class: "lpg-metric-grid" }, prices.map(lpgPriceMetric))
+    : lpgEmpty("No entitled price assessments / 暂无已授权价格", "Use Data Status to review entitlement discovery and source health.");
+  const sourceStrip = sources.length ? el("div", { class: "lpg-source-strip" }, sources.map(source => {
+    const status = lpgValue(source, "status", "state") || "unknown";
+    return el("div", { class: "lpg-source-item" }, [
+      el("strong", { text: lpgValue(source, "source", "name") || "Source" }),
+      lpgBadge(status, lpgIsStale(source), source.error || ""),
+      el("span", { text: lpgDate(lpgValue(source, "last_success_at", "updated_at"), true) }),
+    ]);
+  })) : lpgEmpty("Source status pending / 数据源状态待确认");
+  body.replaceChildren(
+    lpgSection("Key Assessments", `${prices.length} series`, priceGrid),
+    lpgSection("Trading Spreads & Arb Signals", `${spreads.length} calculations`, lpgTable(lpgSpreadColumns(), spreads, {
+      empty: "No valid spread calculations / 暂无有效价差",
+      detail: "A stale or mismatched leg is blocked rather than silently combined.",
+    })),
+    lpgSection("Source Health", "entitlement and freshness", sourceStrip),
+  );
+}
+
+function renderLpgCurves(payload) {
+  const curvesData = lpgPayload(payload.curves || {});
+  const spreadsData = lpgPayload(payload.spreads || {});
+  const allowedIds = lpgAllowedSeriesIds(payload.access_catalog);
+  const curves = lpgList(curvesData, ["curves", "items"])
+    .filter(curve => allowedIds.has(lpgSeriesKey(curve)));
+  const spreads = lpgList(spreadsData, ["items", "spreads"]).filter(row => lpgSpreadAllowed(row, allowedIds));
+  const curveList = el("div", { class: "lpg-curve-list" });
+  for (const curve of curves) {
+    const points = lpgList(curve, ["points", "contracts"]).filter(point => {
+      const access = lpgValue(point, "entitlement_state", "entitlement", "access_status");
+      return Number.isFinite(Number(lpgValue(point, "value", "price")))
+        && (!access || String(access).toLowerCase() === "entitled") && lpgIsActive(point);
+    });
+    const values = points.map(point => Number(lpgValue(point, "value", "price")));
+    const labels = points.map(point => lpgValue(point, "contract_month", "tenor", "delivery_start") || "");
+    const chart = values.length > 1
+      ? withHover(svgLine(values, { h: 150, dots: true, xlabels: labels }), values.length,
+        index => `${labels[index]} | ${lpgNumber(values[index], 2)} ${curve.currency || ""}/${curve.unit || ""}`, { h: 150 })
+      : lpgEmpty("Curve needs at least two points / 曲线点不足");
+    const table = lpgTable([
+      { label: "Contract", render: row => lpgValue(row, "contract_month", "tenor", "delivery_start") },
+      { label: "Delivery", render: row => [row.delivery_start, row.delivery_end].filter(Boolean).map(lpgDate).join(" to ") || "N/A" },
+      { label: "Value", class: "num", render: row => `${lpgNumber(lpgValue(row, "value", "price"), 2)} ${lpgValue(row, "currency") || curve.currency || ""}/${lpgValue(row, "unit") || curve.unit || ""}` },
+      { label: "As of", render: row => lpgDate(lpgValue(row, "as_of_date", "observation_date", "date", "as_of") || curve.as_of_date || curvesData.as_of) },
+      { label: "State", render: row => lpgBadge(lpgValue(row, "entitlement_state", "entitlement", "access_status") || lpgValue(curve, "entitlement_state", "entitlement") || "entitled", lpgIsStale(row) || lpgIsStale(curve)) },
+    ], points, { empty: "No entitled curve points / 暂无已授权曲线点" });
+    curveList.appendChild(el("article", { class: "lpg-curve-block" }, [
+      el("div", { class: "lpg-curve-title" }, [
+        el("strong", { text: lpgValue(curve, "name", "canonical_key", "series_id") || "Forward curve" }),
+        el("span", { class: "meta", text: `${points.length} points | ${curve.currency || "N/A"}/${curve.unit || "N/A"}` }),
+      ]),
+      el("div", { class: "lpg-curve-layout" }, [chart, table]),
+    ]));
+  }
+  if (!curves.length) curveList.appendChild(lpgEmpty("No forward curves / 暂无远期曲线", "Review entitlements in Data Status or select a different as-of date."));
+  byId("lpg-body").replaceChildren(
+    lpgSection("Forward Curves", `${curves.length} curves`, curveList),
+    lpgSection("Calendar, Feedstock & Arb Spreads", `${spreads.length} calculations`, lpgTable(lpgSpreadColumns(), spreads, {
+      empty: "No spreads for this as-of date / 当前日期暂无价差",
+    })),
+  );
+}
+
+async function loadLpgHistory() {
+  const token = ++state.lpgRequestToken;
+  byId("lpg-body").replaceChildren(el("div", { class: "loading", text: "Loading series history / 正在加载历史..." }));
+  byId("refresh").classList.add("spin");
+  try {
+    const catalogRaw = await fetchJSON(lpgApiUrl("series", { limit: 5000 }, { asOf: null }));
+    const catalog = lpgPayload(catalogRaw);
+    const series = lpgList(catalog, ["items", "series"]);
+    const current = series.find(item => String(item.id || item.series_id) === String(state.lpgSeriesId));
+    if (!current || !lpgSeriesAllowed(current)) {
+      const first = series.find(lpgSeriesAllowed);
+      state.lpgSeriesId = first ? (first.id || first.series_id) : null;
+    }
+    updateLpgExportLinks();
+    let history = null, historyError = "";
+    if (state.lpgSeriesId) {
+      try {
+        history = lpgPayload(await fetchJSON(lpgApiUrl(
+          `series/${encodeURIComponent(state.lpgSeriesId)}/history`, {}, { asOf: "end" },
+        )));
+      } catch (error) { historyError = error.message; }
+    }
+    if (token !== state.lpgRequestToken || state.view !== "lpg" || state.lpgView !== "history") return;
+    const payload = { catalog, history, historyError };
+    state.lpgData.history = payload;
+    renderLpgHistory(payload);
+    updateLpgMeta(history || catalog);
+  } catch (error) {
+    if (token === state.lpgRequestToken) byId("lpg-body").replaceChildren(lpgEmpty("History unavailable / 历史数据不可用", error.message));
+  } finally {
+    if (token === state.lpgRequestToken && !(state.lpgRefreshJob && state.lpgRefreshJob.running)) byId("refresh").classList.remove("spin");
+  }
+}
+
+function lpgMean(values) {
+  const nums = values.filter(value => Number.isFinite(value));
+  return nums.length ? nums.reduce((sum, value) => sum + value, 0) / nums.length : null;
+}
+
+function lpgSeasonality(observations) {
+  const monthly = new Map();
+  for (const row of observations) {
+    const date = new Date(row.date);
+    if (Number.isNaN(date.getTime())) continue;
+    const key = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+    if (!monthly.has(key)) monthly.set(key, []);
+    monthly.get(key).push(row.value);
+  }
+  const averages = [...monthly.entries()].map(([key, values]) => ({ key, value: lpgMean(values) })).sort((a, b) => a.key.localeCompare(b.key));
+  const returns = Array.from({ length: 12 }, () => []);
+  for (let index = 1; index < averages.length; index++) {
+    const prev = averages[index - 1], cur = averages[index];
+    const prevDate = new Date(prev.key + "-01T00:00:00Z"), curDate = new Date(cur.key + "-01T00:00:00Z");
+    const monthGap = (curDate.getUTCFullYear() - prevDate.getUTCFullYear()) * 12 + curDate.getUTCMonth() - prevDate.getUTCMonth();
+    if (monthGap === 1 && prev.value) returns[curDate.getUTCMonth()].push((cur.value / prev.value - 1) * 100);
+  }
+  return returns.map((values, month) => ({ month: MONTHS[month], value: lpgMean(values), samples: values.length }));
+}
+
+function renderLpgHistory(payload) {
+  const series = lpgList(payload.catalog, ["items", "series"]);
+  const selected = series.find(item => String(item.id || item.series_id) === String(state.lpgSeriesId));
+  const entitled = series.filter(lpgSeriesAllowed);
+  const select = el("select", { "aria-label": "Select LPG series" });
+  if (!entitled.length) select.appendChild(el("option", { value: "", text: "No entitled series / 无已授权系列" }));
+  for (const item of entitled) {
+    const option = el("option", {
+      value: item.id || item.series_id,
+      text: `${lpgValue(item, "name", "canonical_key", "symbol", "id")} (${item.unit || "N/A"})`,
+    });
+    option.selected = String(item.id || item.series_id) === String(state.lpgSeriesId);
+    select.appendChild(option);
+  }
+  select.onchange = event => {
+    state.lpgSeriesId = event.target.value || null;
+    updateLpgExportLinks();
+    loadLpgHistory();
+  };
+  const search = el("input", {
+    type: "search", value: state.lpgSeriesQuery, placeholder: "Filter catalog...", "aria-label": "Filter LPG series catalog",
+  });
+  search.oninput = event => {
+    state.lpgSeriesQuery = event.target.value || "";
+    renderLpgHistory(state.lpgData.history);
+    const next = document.querySelector(".lpg-series-search");
+    if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+  };
+  search.className = "lpg-series-search";
+  const toolbar = el("div", { class: "lpg-toolbar" }, [
+    el("label", { class: "lpg-field", text: "Series" }, select),
+    search,
+  ]);
+  const content = [toolbar];
+  const historySeries = payload.history && (payload.history.series || selected);
+  const historyAuthorized = Boolean(selected && lpgSeriesAllowed(selected)
+    && (!historySeries || lpgSeriesAllowed(historySeries)));
+  const history = historyAuthorized ? payload.history : null;
+  const historyError = payload.history && !historyAuthorized
+    ? "History blocked because the series is not both entitled and active."
+    : payload.historyError;
+  if (!history) {
+    content.push(lpgEmpty(historyError ? "Series history unavailable / 历史不可用" : "Select an entitled series / 请选择已授权系列", historyError));
+  } else {
+    const observations = lpgList(history, ["observations", "history", "items"])
+      .map(row => ({ raw: row, date: lpgValue(row, "date", "observation_date"), value: Number(lpgValue(row, "value", "price", "close")) }))
+      .filter(row => row.date && Number.isFinite(row.value)).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const values = observations.map(row => row.value);
+    const latest = values.length ? values[values.length - 1] : null;
+    const stats = history.statistics || {};
+    const statGrid = el("div", { class: "lpg-stat-strip" }, [
+      lpgStat("Latest", lpgNumber(lpgValue(stats, "current", "latest", "last") ?? latest, 2)),
+      lpgStat("Average", lpgNumber(lpgValue(stats, "average", "mean") ?? lpgMean(values), 2)),
+      lpgStat("Low", lpgNumber(lpgValue(stats, "minimum", "min") ?? (values.length ? Math.min(...values) : null), 2)),
+      lpgStat("High", lpgNumber(lpgValue(stats, "maximum", "max") ?? (values.length ? Math.max(...values) : null), 2)),
+      lpgStat("Observations", values.length.toLocaleString()),
+    ]);
+    const chart = values.length > 1
+      ? withHover(svgLine(values, { h: 190, area: true }), values.length,
+        index => `${observations[index].date} | ${lpgNumber(values[index], 3)}`, { h: 190 })
+      : lpgEmpty("Insufficient history / 历史样本不足");
+    const serverSeasonality = history.seasonality || {};
+    const serverMonthly = lpgList(serverSeasonality, ["monthly_stats"]);
+    const fallbackSeason = lpgSeasonality(observations);
+    const byMonth = new Map(serverMonthly.map(row => [
+      Number(row.month_number) || MONTHS.indexOf(row.month) + 1,
+      {
+        month: row.month || MONTHS[(Number(row.month_number) || 1) - 1],
+        value: lpgValue(row, "avg_return_pct", "value"),
+        median: lpgValue(row, "median_return_pct", "median"),
+        winRate: lpgValue(row, "win_rate_pct", "win_rate"),
+        samples: lpgValue(row, "years_observed", "samples") || 0,
+      },
+    ]));
+    const season = serverMonthly.length
+      ? MONTHS.map((month, index) => byMonth.get(index + 1) || { month, value: null, median: null, winRate: null, samples: 0 })
+      : fallbackSeason;
+    const seasonValues = season.map(row => row.value);
+    const seasonChart = season.some(row => row.value !== null)
+      ? withHover(svgBars(seasonValues, { h: 150, labels: MONTHS.map(month => month[0]) }), 12,
+        index => `${MONTHS[index]} | ${lpgNumber(season[index].value, 2)}% | ${season[index].samples} samples`, { h: 150, band: true })
+      : lpgEmpty("Seasonality needs consecutive monthly history / 月度样本不足");
+    const historySections = [
+      lpgSection("Price History", `${selected ? selected.name || selected.canonical_key : "Series"} | ${history.series?.currency || selected?.currency || "N/A"}/${history.series?.unit || selected?.unit || "N/A"}`, [statGrid, el("div", { class: "lpg-history-chart" }, chart)]),
+      lpgSection("Seasonality", serverMonthly.length ? "server-calculated month-end returns" : "average month-on-month return", [seasonChart, lpgTable([
+        { label: "Month", render: row => row.month },
+        { label: "Avg return", class: "num", render: row => row.value === null ? "N/A" : `${lpgNumber(row.value, 2)}%` },
+        { label: "Median", class: "num", render: row => row.median === null || row.median === undefined ? "N/A" : `${lpgNumber(row.median, 2)}%` },
+        { label: "Win rate", class: "num", render: row => row.winRate === null || row.winRate === undefined ? "N/A" : `${lpgNumber(row.winRate, 1)}%` },
+        { label: "Samples", class: "num", render: row => row.samples },
+      ], season)]),
+      lpgSection("Recent Assessments", `latest ${Math.min(100, observations.length)} rows`, lpgTable([
+        { label: "Date", render: row => lpgDate(row.date) },
+        { label: "Value", class: "num", render: row => lpgNumber(row.value, 3) },
+        { label: "Bate", render: row => row.raw.bate || "N/A" },
+        { label: "Published", render: row => lpgDate(row.raw.publication_time, true) },
+        { label: "Revisions", class: "num", render: row => row.raw.revision_count || 0 },
+      ], observations.slice(-100).reverse())),
+    ];
+    const rawBands = lpgList(serverSeasonality, ["bands"]);
+    if (rawBands.length) {
+      const bandByMonth = new Map(rawBands.map(row => [Number(row.month_number) || MONTHS.indexOf(row.month) + 1, row]));
+      const bands = MONTHS.map((month, index) => bandByMonth.get(index + 1) || {
+        month, hist_min: null, hist_max: null, hist_avg: null, current_year: null, years_in_band: 0,
+      });
+      const hasBands = bands.some(row => row.hist_min !== null && row.hist_max !== null);
+      if (hasBands) {
+        const bandChart = withHover(svgBands(bands, { h: 160, labels: MONTHS.map(month => month[0]) }), 12,
+          index => `${MONTHS[index]} | avg ${lpgNumber(bands[index].hist_avg, 2)} | range ${lpgNumber(bands[index].hist_min, 2)}-${lpgNumber(bands[index].hist_max, 2)}`,
+          { h: 160, band: true });
+        historySections.splice(2, 0, lpgSection("Seasonal Price Bands", `${serverSeasonality.years || 0} years`, [
+          el("div", { class: "lpg-history-chart" }, bandChart),
+        ]));
+      }
+    }
+    content.push(...historySections);
+  }
+  const query = state.lpgSeriesQuery.trim().toLowerCase();
+  const visible = series.filter(item => !query || [item.id, item.symbol, item.name, item.product, item.market, item.location, item.canonical_key].join(" ").toLowerCase().includes(query));
+  content.push(lpgSection("Series Catalog", `${visible.length}/${series.length} series`, lpgTable([
+    { label: "Series", render: row => lpgValue(row, "name", "canonical_key", "symbol", "id") },
+    { label: "Market", render: row => [row.product, row.market, row.location].filter(Boolean).join(" | ") || "N/A" },
+    { label: "Basis", render: row => row.basis || "N/A" },
+    { label: "Unit", render: row => [row.currency, row.unit].filter(Boolean).join("/") || "N/A" },
+    { label: "Coverage", render: row => [row.first_date, row.last_date].filter(Boolean).map(lpgDate).join(" to ") || "N/A" },
+    { label: "Access", render: row => lpgBadge(lpgEntitlement(row), lpgIsStale(row)) },
+  ], visible, {
+    empty: "No catalog matches / 没有匹配系列",
+    onRow: row => { if (lpgSeriesAllowed(row)) { state.lpgSeriesId = row.id || row.series_id; loadLpgHistory(); } },
+    isRowClickable: lpgSeriesAllowed,
+  })));
+  byId("lpg-body").replaceChildren(...content);
+}
+
+function lpgStat(label, value) {
+  return el("div", { class: "lpg-stat" }, [el("span", { text: label }), el("strong", { text: String(value) })]);
+}
+
+function renderLpgMoc(data) {
+  const rows = lpgList(data, ["rows", "items", "trades", "moc"]);
+  const fundamentals = lpgList(data, ["fundamentals", "balances", "flows"]);
+  const select = el("select", { "aria-label": "MOC and fundamentals dataset" }, [
+    el("option", { value: "moc", text: "eWindow / MOC" }),
+    el("option", { value: "fundamentals", text: "Fundamentals" }),
+    el("option", { value: "all", text: "All observations" }),
+  ]);
+  select.value = state.lpgMocDataset;
+  select.onchange = event => { state.lpgMocDataset = event.target.value; loadLpgView("moc"); };
+  const toolbar = el("div", { class: "lpg-toolbar" }, [el("label", { class: "lpg-field", text: "Dataset" }, select)]);
+  const sections = [toolbar];
+  if (rows.length) sections.push(lpgSection("Market on Close & eWindow", `${rows.length} records`, lpgGenericTable(data, { rows })));
+  if (fundamentals.length) sections.push(lpgSection("Physical Fundamentals", `${fundamentals.length} records`, lpgGenericTable({}, { rows: fundamentals })));
+  if (!rows.length && !fundamentals.length) sections.push(lpgEmpty(
+    "No MOC or fundamentals records / 暂无MOC或基本面数据",
+    "The view remains available while entitlement discovery or Excel ingestion is pending.",
+  ));
+  byId("lpg-body").replaceChildren(...sections);
+}
+
+function lpgOptionValues(items, key) {
+  return [...new Set(items.map(item => item[key]).filter(Boolean).map(String))].sort((a, b) => a.localeCompare(b));
+}
+
+function lpgFilterSelect(label, value, values, onChange) {
+  const select = el("select", { "aria-label": label });
+  select.appendChild(el("option", { value: "all", text: `${label}: All` }));
+  for (const item of values) select.appendChild(el("option", { value: item, text: item }));
+  select.value = values.includes(value) ? value : "all";
+  select.onchange = event => onChange(event.target.value);
+  return select;
+}
+
+function renderLpgNews(data) {
+  const items = lpgList(data, ["items", "articles", "news"]);
+  const filter = state.lpgNewsFilter;
+  const query = filter.query.trim().toLowerCase();
+  const visible = items.filter(item => {
+    const hay = [item.headline, item.title, item.summary, item.source, item.region, item.product, item.direction, ...(item.tags || [])].join(" ").toLowerCase();
+    return (!query || hay.includes(query))
+      && (filter.region === "all" || String(item.region) === filter.region)
+      && (filter.product === "all" || String(item.product) === filter.product)
+      && (filter.direction === "all" || String(item.direction) === filter.direction);
+  });
+  const search = el("input", { type: "search", value: filter.query, placeholder: "Search headline, market, tag...", "aria-label": "Filter LPG news" });
+  search.oninput = event => {
+    state.lpgNewsFilter.query = event.target.value || "";
+    updateLpgExportLinks();
+    renderLpgNews(state.lpgData.news);
+    const next = document.querySelector(".lpg-news-search");
+    if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+  };
+  search.className = "lpg-news-search";
+  const rerender = (key, value) => {
+    state.lpgNewsFilter[key] = value;
+    updateLpgExportLinks();
+    renderLpgNews(state.lpgData.news);
+  };
+  const toolbar = el("div", { class: "lpg-toolbar lpg-news-toolbar" }, [
+    search,
+    lpgFilterSelect("Region", filter.region, lpgOptionValues(items, "region"), value => rerender("region", value)),
+    lpgFilterSelect("Product", filter.product, lpgOptionValues(items, "product"), value => rerender("product", value)),
+    lpgFilterSelect("Direction", filter.direction, lpgOptionValues(items, "direction"), value => rerender("direction", value)),
+  ]);
+  const list = el("div", { class: "lpg-news-list" });
+  if (!visible.length) list.appendChild(lpgEmpty(
+    items.length ? "No headlines match / 没有匹配新闻" : "No licensed LPG headlines / 暂无授权LPG新闻",
+    items.length ? "Adjust filters to widen the result." : "Public fallback and Platts news entitlement status are shown in Data Status.",
+  ));
+  for (const article of visible) {
+    const title = article.url
+      ? el("a", { class: "lpg-news-title", text: article.headline || article.title || "Untitled", href: article.url, target: "_blank", rel: "noopener" })
+      : el("span", { class: "lpg-news-title", text: article.headline || article.title || "Untitled" });
+    const tags = [article.region, article.product, ...(article.tags || [])].filter(Boolean);
+    list.appendChild(el("article", { class: "lpg-news-row" }, [
+      el("div", { class: "lpg-news-meta" }, [
+        el("span", { class: "news-source", text: article.source || "News" }),
+        el("span", { text: lpgDate(lpgValue(article, "published_at", "published"), true) }),
+        lpgBadge(article.direction || "neutral", false),
+        el("span", { class: `lpg-importance ${String(article.importance || "normal").toLowerCase()}`, text: article.importance || "normal" }),
+      ]),
+      title,
+      article.summary ? el("p", { text: article.summary }) : null,
+      tags.length ? el("div", { class: "chip-row" }, tags.slice(0, 10).map(tag => el("span", { class: "chip", text: tag }))) : null,
+    ].filter(Boolean)));
+  }
+  byId("lpg-body").replaceChildren(
+    toolbar,
+    lpgSection("LPG News Flow", `${visible.length}/${data.total || items.length} headlines`, list),
+  );
+}
+
+function renderLpgExplorer(data) {
+  const explorer = state.lpgExplorer;
+  const form = el("form", { class: "lpg-toolbar lpg-explorer-toolbar" });
+  const dataset = el("select", { "aria-label": "Explorer dataset" });
+  for (const item of ["series", "observations", "curves", "spreads", "news", "candidates", "revisions", "runs"]) {
+    dataset.appendChild(el("option", { value: item, text: item[0].toUpperCase() + item.slice(1) }));
+  }
+  dataset.value = explorer.dataset;
+  const query = el("input", { type: "search", value: explorer.query, placeholder: "Search dataset...", "aria-label": "Search LPG dataset" });
+  const entitlement = el("select", { "aria-label": "Entitlement filter" }, [
+    el("option", { value: "all", text: "All access states" }),
+    el("option", { value: "entitled", text: "Entitled / 已授权" }),
+    el("option", { value: "unentitled", text: "Unentitled / 未授权" }),
+    el("option", { value: "pending_review", text: "Pending / 待确认" }),
+    el("option", { value: "error", text: "Error / 异常" }),
+  ]);
+  entitlement.value = explorer.entitlement;
+  const submit = el("button", { type: "submit", class: "lpg-command", text: "Apply" });
+  form.append(dataset, query, entitlement, submit);
+  form.onsubmit = event => {
+    event.preventDefault();
+    state.lpgExplorer = { ...explorer, dataset: dataset.value, query: query.value.trim(), entitlement: entitlement.value, offset: 0 };
+    updateLpgExportLinks();
+    loadLpgView("explorer");
+  };
+  const total = Number(data.total || (data.rows || []).length || 0);
+  const offset = Number(data.offset ?? explorer.offset);
+  const limit = Number(data.limit || explorer.limit);
+  const pager = el("div", { class: "lpg-pager" }, [
+    el("span", { text: total ? `${offset + 1}-${Math.min(offset + limit, total)} of ${total}` : "0 rows" }),
+  ]);
+  const prev = el("button", { type: "button", text: "Previous", disabled: offset <= 0 ? "disabled" : null });
+  const next = el("button", { type: "button", text: "Next", disabled: offset + limit >= total ? "disabled" : null });
+  prev.onclick = () => { state.lpgExplorer.offset = Math.max(0, offset - limit); loadLpgView("explorer"); };
+  next.onclick = () => { state.lpgExplorer.offset = offset + limit; loadLpgView("explorer"); };
+  pager.append(prev, next);
+  byId("lpg-body").replaceChildren(
+    form,
+    lpgSection("Dataset Results", `${data.dataset || explorer.dataset} | ${total} rows`, [lpgGenericTable(data), pager]),
+  );
+}
+
+function lpgRefreshRows(row) {
+  if (!row || typeof row !== "object") return 0;
+  const counts = row.counts || {};
+  const direct = [
+    row.rows_written, row.rows_imported, row.row_count,
+    counts.rows_inserted, counts.rows_updated,
+    row.rows_inserted, row.rows_updated,
+  ].map(Number).filter(Number.isFinite);
+  if (direct.length) return direct.reduce((sum, value) => sum + value, 0);
+  for (const key of ["result", "import", "market", "news"]) {
+    const nested = lpgRefreshRows(row[key]);
+    if (nested) return nested;
+  }
+  return 0;
+}
+
+function renderLpgStatus(data) {
+  const catalog = data.catalog || {};
+  const states = catalog.states || catalog.entitlement_states || {};
+  const sources = lpgList(data, ["sources", "source_status"]);
+  const runs = lpgList(data, ["runs", "refresh_runs", "jobs"]);
+  const candidates = data.candidates || {};
+  const candidateStates = candidates.states || {};
+  const matrix = lpgList(data, ["entitlement_matrix"]);
+  const statStrip = el("div", { class: "lpg-stat-strip" }, [
+    lpgStat("Candidates", Number(candidates.total || matrix.length || 0).toLocaleString()),
+    lpgStat("Entitled", Number(states.entitled || candidateStates.entitled || 0).toLocaleString()),
+    lpgStat("Unentitled", Number(states.unentitled || candidateStates.unentitled || 0).toLocaleString()),
+    lpgStat("Pending review", Number(states.pending_review || candidateStates.pending_review || 0).toLocaleString()),
+    lpgStat("Sources active", sources.filter(source => lpgStateInfo(source.status).cls === "ok").length.toString()),
+  ]);
+  const database = data.database;
+  const databaseLine = database ? el("div", { class: "lpg-database-line" }, [
+    el("strong", { text: "Local database" }),
+    el("span", { text: typeof database === "string" ? database : lpgGenericValue(database) }),
+  ]) : null;
+  byId("lpg-body").replaceChildren(
+    lpgSection("Coverage & Entitlements", `Updated ${lpgDate(data.updated_at, true)}`, [statStrip, databaseLine]),
+    lpgSection("Entitlement Matrix", `${matrix.length} candidates`, lpgTable([
+      { label: "Target", render: row => lpgValue(row, "name", "canonical_key", "candidate_id") },
+      { label: "Symbol / Curve", render: row => lpgValue(row, "mapped_symbol", "discovered_symbol", "discovered_curve_code") || "Pending discovery" },
+      { label: "Market", render: row => [row.product, row.market, row.location].filter(Boolean).join(" | ") || "N/A" },
+      { label: "Access", render: row => lpgBadge(lpgValue(row, "discovery_status", "entitlement_state", "status")) },
+      { label: "Coverage", render: row => [row.first_date, row.last_date].filter(Boolean).map(lpgDate).join(" to ") || "N/A" },
+      { label: "Reason", render: row => row.error || row.entitlement_reason || "N/A" },
+    ], matrix, { empty: "Entitlement discovery has not run / 尚未执行授权发现" })),
+    lpgSection("Source Health", `${sources.length} sources`, lpgTable([
+      { label: "Source", render: row => lpgValue(row, "source", "name") },
+      { label: "State", render: row => lpgBadge(lpgValue(row, "status", "state"), lpgIsStale(row), row.error || "") },
+      { label: "Last success", render: row => lpgDate(row.last_success_at, true) },
+      { label: "Last attempt", render: row => lpgDate(row.last_attempt_at, true) },
+      { label: "Message", render: row => row.error || row.message || "OK" },
+    ], sources, { empty: "No source checks recorded / 暂无数据源检查" })),
+    lpgSection("Refresh Runs", `${runs.length} recent runs`, lpgTable([
+      { label: "Run", render: row => lpgValue(row, "id", "job_id", "run_id") },
+      { label: "Scope", render: row => [row.source, row.scope].filter(Boolean).join(" / ") || "N/A" },
+      { label: "State", render: row => lpgBadge(lpgValue(row, "status", "state")) },
+      { label: "Started", render: row => lpgDate(row.started_at, true) },
+      { label: "Finished", render: row => lpgDate(row.finished_at, true) },
+      { label: "Rows", class: "num", render: row => lpgRefreshRows(row) },
+      { label: "Message", render: row => row.error || row.message || "N/A" },
+    ], runs, { empty: "No refresh runs recorded / 暂无刷新记录" })),
+  );
+}
+
+function setLpgRefreshState(label, tone = "") {
+  state.lpgRefreshJob = label ? { ...(state.lpgRefreshJob || {}), label } : null;
+  const status = byId("lpg-refresh-state");
+  if (status) { status.textContent = label || ""; status.className = `lpg-job-state ${tone}`.trim(); }
+}
+
+async function startLpgRefresh(scope = "all") {
+  if (state.lpgRefreshJob && state.lpgRefreshJob.running) return;
+  if (state.lpgRefreshTimer) clearTimeout(state.lpgRefreshTimer);
+  state.lpgRefreshJob = { running: true, scope, label: "Starting refresh / 正在启动" };
+  setLpgRefreshState(state.lpgRefreshJob.label, "running");
+  const button = byId("lpg-refresh");
+  if (button) button.disabled = true;
+  byId("refresh").classList.add("spin");
+  try {
+    const response = lpgPayload(await requestJSON("/api/lpg/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope }),
+    }));
+    const job = response.job || response;
+    const id = job.job_id || job.id || response.run_id;
+    if (!id) {
+      finishLpgRefresh(true, "Refresh completed / 刷新完成");
+      return;
+    }
+    state.lpgRefreshJob = { running: true, id, scope, label: `Running ${scope} / 刷新中` };
+    setLpgRefreshState(state.lpgRefreshJob.label, "running");
+    pollLpgRefresh(id, 0);
+  } catch (error) {
+    finishLpgRefresh(false, `Refresh failed / 刷新失败: ${error.message}`);
+  }
+}
+
+async function pollLpgRefresh(id, attempt) {
+  try {
+    const response = lpgPayload(await fetchJSON(`/api/lpg/refresh/${encodeURIComponent(id)}`));
+    const job = response.job || response;
+    const status = String(job.status || job.state || "running").toLowerCase();
+    if (["completed", "complete", "success", "succeeded", "done"].includes(status)) {
+      finishLpgRefresh(true, "Refresh completed / 刷新完成");
+      return;
+    }
+    if (status === "partial") {
+      finishLpgRefresh(true, "Refresh partially completed / 部分刷新完成", "warn");
+      return;
+    }
+    if (status === "deferred") {
+      finishLpgRefresh(false, "Refresh deferred because Excel is open / Excel占用，刷新已延后", "warn");
+      return;
+    }
+    if (["failed", "error", "blocked", "cancelled"].includes(status)) {
+      finishLpgRefresh(false, `Refresh failed / 刷新失败${job.error ? ": " + job.error : ""}`);
+      return;
+    }
+    const rows = lpgRefreshRows(job);
+    setLpgRefreshState(`Running / 刷新中${rows ? ` | ${rows} rows` : ""}`, "running");
+    if (attempt >= 119) {
+      finishLpgRefresh(false, "Refresh still running / 后台仍在刷新");
+      return;
+    }
+    state.lpgRefreshTimer = setTimeout(() => pollLpgRefresh(id, attempt + 1), 1500);
+  } catch (error) {
+    if (attempt < 3) {
+      state.lpgRefreshTimer = setTimeout(() => pollLpgRefresh(id, attempt + 1), 2000);
+    } else finishLpgRefresh(false, `Refresh status unavailable / 无法获取刷新状态: ${error.message}`);
+  }
+}
+
+function finishLpgRefresh(success, message, tone = success ? "ok" : "bad") {
+  if (state.lpgRefreshTimer) clearTimeout(state.lpgRefreshTimer);
+  state.lpgRefreshTimer = null;
+  state.lpgRefreshJob = null;
+  setLpgRefreshState(message, tone);
+  const button = byId("lpg-refresh");
+  if (button) button.disabled = false;
+  byId("refresh").classList.remove("spin");
+  if (success && state.view === "lpg") {
+    state.lpgData = {};
+    loadLpgView(state.lpgView);
+  }
+}
+
 // ---------- SVG charts (dependency-free) ----------
 const SVGNS = "http://www.w3.org/2000/svg";
 const svgEl = (tag, attrs) => el(tag, Object.assign({ ns: SVGNS }, attrs));
@@ -1250,6 +2239,7 @@ $("#refresh").onclick = () => {
   if (state.view === "spreads") loadSpreads(true);
   else if (state.view === "energy-hub") loadEnergyHub(true);
   else if (state.view === "news") loadNews(true);
+  else if (state.view === "lpg") startLpgRefresh((byId("lpg-refresh-scope") || {}).value || "all");
   else if (state.view === "detail" && state.detailId) {
     for (const key of ALL_CARDS) if (byId("card-" + key)) setCardLoading(key);
     loadPanels(state.detailId, true);
@@ -1277,5 +2267,6 @@ document.addEventListener("visibilitychange", () => {
 
 window.addEventListener("hashchange", route);
 $("#footer-note").textContent = location.host;
+renderTabs([]);
 loadOverview();
 route();

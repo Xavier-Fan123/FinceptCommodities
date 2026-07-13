@@ -16,3 +16,6 @@ node_modules/
 dist/
 build/
 
+# Licensed/private market data and local exports
+data/private/
+data/exports/

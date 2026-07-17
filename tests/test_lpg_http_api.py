@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from _support import WorkspaceScratchMixin
 from http.server import ThreadingHTTPServer
@@ -15,11 +16,22 @@ from lpg.service import LpgService
 class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
+        self.staging_patch = patch(
+            "lpg.platts_excel.STAGING_DIR", self.scratch / "staging",
+        )
+        self.staging_patch.start()
+        self.addCleanup(self.staging_patch.stop)
         self.service = LpgService(db_path=self.scratch / "http.sqlite")
         self._seed()
+        self.refresh_calls = []
+
+        def refresh_runner(scope, **parameters):
+            self.refresh_calls.append((scope, parameters))
+            return {"state": "succeeded", "scope": scope,
+                    "parameters": parameters, "counts": {"rows_inserted": 1}}
+
         self.jobs = RefreshJobManager(
-            lambda scope: {"state": "succeeded", "scope": scope,
-                           "counts": {"rows_inserted": 1}},
+            refresh_runner,
         )
         self.previous_runtime = server._LPG_RUNTIME
         server._LPG_RUNTIME = (self.service, object(), self.jobs)
@@ -134,6 +146,81 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
         _, _, observations = self.json_request("GET", "/api/lpg/explorer?dataset=observations")
         self.assertEqual(["fei"], [row["series_id"] for row in observations["rows"]])
 
+    def test_history_curve_provenance_and_dataset_health_contract(self):
+        self.service.upsert_observation({
+            "series_id": "fei", "observation_date": "2026-07-09",
+            "value_native": 518, "currency_native": "USD", "unit_native": "mt",
+            "value_normalized": 518, "currency_normalized": "USD",
+            "unit_normalized": "mt", "bate": "c",
+            "fetched_at": "2026-07-10T10:00:00+00:00",
+        })
+        for series_id, canonical, value in (
+            ("hm1", "FEI_PROPANE_HM1", 520),
+            ("hm2", "FEI_PROPANE_HM2", 524),
+            ("hm3", "FEI_PROPANE_HM3", 529),
+        ):
+            self.service.upsert_series({
+                "id": series_id, "canonical_key": canonical, "name": canonical,
+                "source": "fixture", "symbol": series_id.upper(),
+                "currency": "USD", "unit": "mt", "normalized_currency": "USD",
+                "normalized_unit": "mt", "entitlement_state": "entitled", "active": True,
+            })
+            self.service.upsert_observation({
+                "series_id": series_id, "observation_date": "2026-07-10",
+                "value_native": value, "currency_native": "USD", "unit_native": "mt",
+                "value_normalized": value, "currency_normalized": "USD",
+                "unit_normalized": "mt", "bate": "c",
+                "fetched_at": "2026-07-10T10:00:00+00:00",
+            })
+        self.service.upsert_dataset_row({
+            "dataset": "platts_fundamentals", "row_key": "inventory-1",
+            "as_of_date": "2026-07-10", "source": "fixture",
+            "payload": {"series_id": "inventory", "value": 12},
+        })
+
+        status, _, history = self.json_request("GET", "/api/lpg/series/fei/history")
+        self.assertEqual((200, 2, "ready"), (
+            status, len(history["observations"]), history["availability"]["status"],
+        ))
+
+        status, _, curves = self.json_request("GET", "/api/lpg/curves")
+        self.assertEqual((200, 1, 1), (
+            status, curves["official_curve_count"], curves["derived_curve_count"],
+        ))
+        derived = next(curve for curve in curves["curves"] if curve["derived"])
+        self.assertEqual(("derived_prompt_structure", ["hm1", "hm2", "hm3"]), (
+            derived["curve_kind"], derived["component_series_ids"],
+        ))
+        official = next(curve for curve in curves["curves"] if curve["is_official"])
+        self.assertEqual("official_fc_curve", official["curve_kind"])
+
+        status, _, empty = self.json_request(
+            "GET", "/api/lpg/curves?series_id=missing-series",
+        )
+        self.assertEqual((200, [], "empty"), (status, empty["curves"], empty["status"]))
+        self.assertTrue(empty["reason"])
+
+        status, _, health = self.json_request("GET", "/api/lpg/status")
+        self.assertEqual(200, status)
+        datasets = health["datasets"]
+        self.assertEqual({"current", "history", "curves", "moc", "fundamentals"},
+                         set(datasets))
+        for dataset in datasets.values():
+            self.assertTrue({"rows", "dates", "series", "status", "reason"}
+                            .issubset(dataset))
+        self.assertEqual(("partial", 1), (
+            datasets["history"]["status"], datasets["history"]["multi_date_series"],
+        ))
+        self.assertEqual((1, "ready"), (
+            datasets["moc"]["rows"], datasets["moc"]["status"],
+        ))
+        self.assertEqual((1, "ready"), (
+            datasets["fundamentals"]["rows"], datasets["fundamentals"]["status"],
+        ))
+        self.assertEqual((1, 1), (
+            datasets["curves"]["official_series"], datasets["curves"]["derived_series"],
+        ))
+
     def test_refresh_job_and_validation_errors(self):
         status, _, started = self.json_request("POST", "/api/lpg/refresh", {"scope": "asia"})
         self.assertEqual(202, status)
@@ -150,6 +237,36 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
         status, _, missing = self.json_request("GET", "/api/lpg/refresh/not-a-job")
         self.assertEqual(404, status)
         self.assertIn("unknown", missing["error"])
+
+    def test_history_refresh_targets_selected_symbol_and_validates_parameters(self):
+        status, _, started = self.json_request("POST", "/api/lpg/refresh", {
+            "scope": "history", "symbols": ["PMAAV00"], "market_scope": "asia",
+        })
+        self.assertEqual(202, status)
+        self.assertEqual(
+            {"symbols": ["PMAAV00"], "market_scope": "asia"},
+            started["job"]["parameters"],
+        )
+        job_id = started["job"]["id"]
+        for _ in range(100):
+            _, _, current = self.json_request("GET", f"/api/lpg/refresh/{job_id}")
+            if current["job"]["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+        self.assertEqual(
+            ("history", {"symbols": ["PMAAV00"], "market_scope": "asia"}),
+            self.refresh_calls[-1],
+        )
+
+        for payload in (
+            {"scope": "history", "symbols": ["not a symbol"]},
+            {"scope": "curves", "market_scope": "europe"},
+            {"scope": "asia", "symbols": ["PMAAV00"]},
+        ):
+            with self.subTest(payload=payload):
+                status, _, response = self.json_request("POST", "/api/lpg/refresh", payload)
+                self.assertEqual(400, status)
+                self.assertIn("error", response)
 
     def test_csv_and_xlsx_exports_have_safe_headers(self):
         status, headers, body = self.request(

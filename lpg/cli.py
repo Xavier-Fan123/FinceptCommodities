@@ -34,7 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--symbol", default="PMAAV00")
 
     refresh = sub.add_parser("refresh", help="refresh Excel, stage, and import")
-    refresh.add_argument("--scope", choices=("asia", "overnight", "all", "news"), default="all")
+    refresh.add_argument(
+        "--scope",
+        choices=("asia", "overnight", "all", "news", "history", "curves", "moc"),
+        default="all",
+    )
     refresh.add_argument("--timeout", type=int, default=240)
 
     parse = sub.add_parser("parse", help="parse an already-saved Add-in workbook")
@@ -48,7 +52,48 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--start-year", type=int, required=True)
     backfill.add_argument("--end-year", type=int, required=True)
     backfill.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    backfill.add_argument(
+        "--symbol", action="append",
+        help="configured Platts symbol or candidate id; repeat for a subset",
+    )
+    backfill.add_argument("--batch-size", type=int, default=1)
     backfill.add_argument("--force", action="store_true")
+
+    history = sub.add_parser(
+        "refresh-history", help="build, refresh, stage, and import yearly history batches",
+    )
+    history.add_argument("--start-year", type=int)
+    history.add_argument("--end-year", type=int)
+    history.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    history.add_argument(
+        "--symbol", action="append",
+        help="configured Platts symbol or candidate id; repeat for a subset",
+    )
+    history.add_argument("--batch-size", type=int, default=1)
+    history.add_argument("--timeout", type=int, default=240)
+    history.add_argument("--force", action="store_true")
+
+    build_curves = sub.add_parser("build-curves", help="build isolated FC CurveData workbooks")
+    build_curves.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    build_curves.add_argument("--curve", action="append", help="curve candidate id or FC code")
+    build_curves.add_argument("--batch-size", type=int, default=1)
+    build_curves.add_argument("--force", action="store_true")
+
+    curves = sub.add_parser("refresh-curves", help="refresh, stage, and import FC curves")
+    curves.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    curves.add_argument("--curve", action="append", help="curve candidate id or FC code")
+    curves.add_argument("--batch-size", type=int, default=1)
+    curves.add_argument("--timeout", type=int, default=240)
+    curves.add_argument("--force", action="store_true")
+
+    build_moc = sub.add_parser("build-moc", help="build isolated Platts eWindow workbook")
+    build_moc.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    build_moc.add_argument("--force", action="store_true")
+
+    moc = sub.add_parser("refresh-moc", help="refresh, stage, and import Platts eWindow MOC")
+    moc.add_argument("--scope", choices=("asia", "overnight", "all"), default="all")
+    moc.add_argument("--timeout", type=int, default=240)
+    moc.add_argument("--force", action="store_true")
 
     sub.add_parser("status", help="show the local entitlement and source-health matrix")
     return parser
@@ -70,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         parsed = parse_workbook(args.workbook)
         staged = write_staging(parsed)
         payload = {"parsed": {"status": parsed.get("status"),
+                              "purpose": parsed.get("purpose"),
+                              "year": parsed.get("year"),
                               "records": len(parsed.get("records") or []),
                               "entitlements": len(parsed.get("entitlement_results") or [])},
                    "staging": str(staged) if staged else None}
@@ -79,7 +126,30 @@ def main(argv: list[str] | None = None) -> int:
         payload = service.import_platts_staging(args.staging)
     elif args.command == "build-backfill":
         payload = workflow.build_backfill(
-            args.start_year, args.end_year, scope=args.scope, force=args.force,
+            args.start_year, args.end_year, scope=args.scope, symbols=args.symbol,
+            batch_size=args.batch_size, force=args.force,
+        )
+    elif args.command == "refresh-history":
+        payload = workflow.refresh_history(
+            start_year=args.start_year, end_year=args.end_year, scope=args.scope,
+            symbols=args.symbol, batch_size=args.batch_size,
+            timeout_seconds=args.timeout, force=args.force,
+        )
+    elif args.command == "build-curves":
+        payload = workflow.build_curves(
+            scope=args.scope, curve_ids=args.curve,
+            batch_size=args.batch_size, force=args.force,
+        )
+    elif args.command == "refresh-curves":
+        payload = workflow.refresh_curves(
+            scope=args.scope, curve_ids=args.curve,
+            batch_size=args.batch_size, timeout_seconds=args.timeout, force=args.force,
+        )
+    elif args.command == "build-moc":
+        payload = workflow.build_moc(scope=args.scope, force=args.force)
+    elif args.command == "refresh-moc":
+        payload = workflow.refresh_moc(
+            scope=args.scope, timeout_seconds=args.timeout, force=args.force,
         )
     else:
         payload = service.status()

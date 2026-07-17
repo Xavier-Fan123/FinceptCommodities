@@ -27,7 +27,7 @@ if ($DryRun -or -not $Install) {
         timezone = [TimeZoneInfo]::Local.Id
         expected_timezone = 'Singapore Standard Time'
         interactive_user_only = $true
-        repetition = 'every 15 minutes for 2 hours when Excel is busy'
+        repetition = 'every 15 minutes for 2 hours until the first usable daily refresh'
         tasks = $Definitions
         runner = $Runner
         root = $Root
@@ -59,7 +59,7 @@ foreach ($definition in $Definitions) {
     )
     Register-ScheduledTask -TaskName $definition.Name -Action $action -Trigger $triggers `
         -Principal $principal -Settings $settings -Description `
-        'Refresh Fincept LPG data through the signed-in official S&P Global Energy Excel Add-in.' `
+        'Refresh Fincept LPG data through the signed-in official S&P Global Energy Excel Add-in; later retry triggers skip after daily success.' `
         -Force | Out-Null
 }
 Write-Output 'INSTALLED Fincept LPG scheduled tasks (08:00 overnight, 17:30 Asia close)'

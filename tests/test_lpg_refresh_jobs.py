@@ -71,6 +71,34 @@ class RefreshJobTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             jobs.start("everything")
 
+    def test_specialized_data_scopes_are_supported(self):
+        for scope in ("history", "curves", "moc"):
+            with self.subTest(scope=scope):
+                jobs = RefreshJobManager(
+                    lambda selected: {"state": "succeeded", "scope": selected}
+                )
+                started = jobs.start(scope)
+                current = self.wait_for_terminal(jobs, started["id"])
+                self.assertEqual("succeeded", current["state"])
+                self.assertEqual(scope, current["result"]["scope"])
+
+    def test_targeted_parameters_are_forwarded_and_visible_on_job(self):
+        received = {}
+
+        def runner(scope, **parameters):
+            received.update(parameters)
+            return {"state": "succeeded", "scope": scope, "parameters": parameters}
+
+        jobs = RefreshJobManager(runner)
+        started = jobs.start(
+            "history",
+            parameters={"symbols": ["PMAAV00"], "market_scope": "asia"},
+        )
+        self.assertEqual(["PMAAV00"], started["parameters"]["symbols"])
+        current = self.wait_for_terminal(jobs, started["id"])
+        self.assertEqual("succeeded", current["state"])
+        self.assertEqual({"symbols": ["PMAAV00"], "market_scope": "asia"}, received)
+
 
 if __name__ == "__main__":
     unittest.main()

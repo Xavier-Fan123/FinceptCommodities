@@ -9,7 +9,10 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional
 
 
-VALID_SCOPES = {"asia", "overnight", "all", "news"}
+VALID_SCOPES = {
+    "asia", "overnight", "all", "news",
+    "history", "curves", "moc",
+}
 
 
 class RefreshBusy(RuntimeError):
@@ -19,17 +22,18 @@ class RefreshBusy(RuntimeError):
 
 
 class RefreshJobManager:
-    def __init__(self, runner: Callable[[str], Dict[str, Any]], keep: int = 50):
+    def __init__(self, runner: Callable[..., Dict[str, Any]], keep: int = 50):
         self.runner = runner
         self.keep = max(10, keep)
         self._jobs: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._active_id: Optional[str] = None
         self._lock = threading.Lock()
 
-    def start(self, scope: str) -> Dict[str, Any]:
+    def start(self, scope: str, *, parameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         scope = (scope or "all").lower()
         if scope not in VALID_SCOPES:
             raise ValueError(f"invalid refresh scope '{scope}'")
+        parameters = dict(parameters or {})
         with self._lock:
             if self._active_id:
                 active = self._jobs.get(self._active_id)
@@ -40,6 +44,7 @@ class RefreshJobManager:
             job = {
                 "id": job_id,
                 "scope": scope,
+                "parameters": parameters,
                 "state": "queued",
                 "created_at": now,
                 "started_at": None,
@@ -60,8 +65,9 @@ class RefreshJobManager:
             job["state"] = "running"
             job["started_at"] = int(time.time())
             scope = job["scope"]
+            parameters = dict(job.get("parameters") or {})
         try:
-            result = self.runner(scope) or {}
+            result = (self.runner(scope, **parameters) if parameters else self.runner(scope)) or {}
             state = str(result.get("state") or "succeeded")
             if state not in ("succeeded", "deferred", "partial", "failed", "blocked"):
                 state = "failed"

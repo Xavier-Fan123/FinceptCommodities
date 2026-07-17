@@ -241,6 +241,11 @@ class NewsInput:
     direction: Optional[str] = None
     importance: Optional[str] = None
     tags: List[str] = field(default_factory=list)
+    relevance_score: float = 0.0
+    rank_score: float = 0.0
+    source_tier: int = 0
+    cluster_key: Optional[str] = None
+    is_breaking: bool = False
     entitlement_state: str = "entitled"
     fetched_at: Optional[Union[str, datetime]] = None
     ingestion_run_id: Optional[int] = None
@@ -266,6 +271,11 @@ class NewsInput:
             "direction": self.direction,
             "importance": self.importance,
             "tags_json": json_text(self.tags, []),
+            "relevance_score": finite_number(self.relevance_score) or 0.0,
+            "rank_score": finite_number(self.rank_score) or 0.0,
+            "source_tier": max(0, min(int(self.source_tier or 0), 5)),
+            "cluster_key": self.cluster_key,
+            "is_breaking": 1 if self.is_breaking else 0,
             "entitlement_state": self.entitlement_state,
             "fetched_at": normalize_timestamp(self.fetched_at) or utc_now(),
             "ingestion_run_id": self.ingestion_run_id,

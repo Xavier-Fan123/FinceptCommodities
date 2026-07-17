@@ -29,7 +29,7 @@ DEFAULT_DB_PATH = Path(
         Path(__file__).resolve().parents[1] / "data" / "private" / "lpg.sqlite",
     )
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Platts can return several BATE values for the same assessment.  The official
 # close (c) is the trading default, followed by u/e/l/h.  Keep the preference
@@ -247,6 +247,52 @@ ALTER TABLE catalog_candidates ADD COLUMN discovered_curve_code TEXT;
 ALTER TABLE catalog_candidates ADD COLUMN entitlement_metadata_json TEXT NOT NULL DEFAULT '{}';
 """
 
+_NEWS_V3_COLUMNS = {
+    "relevance_score": "REAL NOT NULL DEFAULT 0",
+    "rank_score": "REAL NOT NULL DEFAULT 0",
+    "source_tier": "INTEGER NOT NULL DEFAULT 0",
+    "cluster_key": "TEXT",
+    "is_breaking": "INTEGER NOT NULL DEFAULT 0",
+}
+
+_NEWS_SOURCE_HEALTH_DDL = r"""CREATE TABLE IF NOT EXISTS news_source_health (
+    source_id TEXT PRIMARY KEY,
+    source_name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'rss',
+    status TEXT NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    last_success_at TEXT,
+    latest_published_at TEXT,
+    article_count INTEGER NOT NULL DEFAULT 0,
+    relevant_count INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER,
+    error TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+
+def _apply_migration_3(connection: sqlite3.Connection) -> None:
+    """Apply the news migration safely after an interrupted/partial attempt."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(news)")}
+    for name, definition in _NEWS_V3_COLUMNS.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE news ADD COLUMN {name} {definition}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_news_rank "
+        "ON news(is_breaking DESC, relevance_score DESC, published_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_news_cluster ON news(cluster_key, published_at DESC)"
+    )
+    connection.execute(_NEWS_SOURCE_HEALTH_DDL)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_news_health_status "
+        "ON news_source_health(status, last_attempt_at DESC)"
+    )
+
 
 def _limit(value: Any, default: int = 500, maximum: int = 5000) -> int:
     try:
@@ -324,6 +370,12 @@ class LpgStore:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (2, now),
                 )
+            if 3 not in applied:
+                _apply_migration_3(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, now),
+                )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.seed_candidates()
 
@@ -378,7 +430,7 @@ class LpgStore:
                     output[target] = json.loads(output.pop(key) or "null")
                 except (TypeError, json.JSONDecodeError):
                     output[target] = None
-        for key in ("active", "summary", "is_correction"):
+        for key in ("active", "summary", "is_correction", "is_breaking"):
             if key in output:
                 output[key] = bool(output[key])
         return json_safe(output)
@@ -843,7 +895,8 @@ class LpgStore:
             columns = (
                 "article_key", "headline", "summary", "body", "url", "source",
                 "published_at", "fetched_at", "language", "region", "product", "topic",
-                "direction", "importance", "tags_json", "entitlement_state",
+                "direction", "importance", "tags_json", "relevance_score", "rank_score",
+                "source_tier", "cluster_key", "is_breaking", "entitlement_state",
                 "ingestion_run_id", "metadata_json",
             )
             connection.execute(
@@ -855,7 +908,10 @@ class LpgStore:
                         fetched_at=excluded.fetched_at,language=excluded.language,
                         region=excluded.region,product=excluded.product,topic=excluded.topic,
                         direction=excluded.direction,importance=excluded.importance,
-                        tags_json=excluded.tags_json,entitlement_state=excluded.entitlement_state,
+                        tags_json=excluded.tags_json,relevance_score=excluded.relevance_score,
+                        rank_score=excluded.rank_score,source_tier=excluded.source_tier,
+                        cluster_key=excluded.cluster_key,is_breaking=excluded.is_breaking,
+                        entitlement_state=excluded.entitlement_state,
                         ingestion_run_id=excluded.ingestion_run_id,metadata_json=excluded.metadata_json,
                         updated_at=excluded.updated_at""",
                 [item.get(column) for column in columns] + [now, now],
@@ -867,13 +923,21 @@ class LpgStore:
 
     def news(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         filters = dict(filters or {})
+        if filters.get("cluster_id") and not filters.get("cluster_key"):
+            filters["cluster_key"] = filters["cluster_id"]
         filters["entitlement_state"] = "entitled"
         where, params = [], []
         for field in ("product", "region", "source", "direction", "importance", "topic",
-                      "entitlement_state"):
+                      "cluster_key", "entitlement_state"):
             if filters.get(field) not in (None, ""):
                 where.append(f"{field}=?")
                 params.append(filters[field])
+        if filters.get("breaking") not in (None, ""):
+            where.append("is_breaking=?")
+            params.append(1 if str(filters["breaking"]).lower() in {"1", "true", "yes"} else 0)
+        if filters.get("min_relevance") not in (None, ""):
+            where.append("relevance_score>=?")
+            params.append(float(filters["min_relevance"]))
         if filters.get("start"):
             where.append("published_at>=?")
             params.append(normalize_timestamp(filters["start"]) or filters["start"])
@@ -889,13 +953,76 @@ class LpgStore:
         limit, offset = _limit(filters.get("limit"), 100), _offset(filters.get("offset"))
         with self._reader() as connection:
             total = connection.execute(f"SELECT COUNT(*) FROM news{clause}", params).fetchone()[0]
+            order = """CASE WHEN is_breaking=1
+                                  AND julianday(published_at) >= julianday('now','-3 hours')
+                             THEN 1 ELSE 0 END DESC,
+                (relevance_score * 0.68
+                 + CASE
+                     WHEN julianday(published_at) >= julianday('now','-3 hours') THEN 22
+                     WHEN julianday(published_at) >= julianday('now','-1 day') THEN 18
+                     WHEN julianday(published_at) >= julianday('now','-3 days') THEN 12
+                     WHEN julianday(published_at) >= julianday('now','-7 days') THEN 6 ELSE 0 END
+                 + source_tier * 2) DESC,
+                published_at DESC,id DESC"""
             rows = connection.execute(
-                f"SELECT * FROM news{clause} ORDER BY published_at DESC,id DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM news{clause} ORDER BY {order} LIMIT ? OFFSET ?",
                 params + [limit, offset],
             ).fetchall()
         return {"items": [self._record(row) for row in rows], "total": total,
                 "limit": limit, "offset": offset,
                 "filters": {key: value for key, value in filters.items() if value not in (None, "")}}
+
+    def upsert_news_source_health(self, value: Mapping[str, Any]) -> Dict[str, Any]:
+        item = dict(value)
+        source_id = str(item.get("source_id") or "").strip()
+        source_name = str(item.get("source_name") or source_id).strip()
+        if not source_id or not source_name:
+            raise ValueError("news source_id and source_name are required")
+        attempted = normalize_timestamp(item.get("last_attempt_at")) or utc_now()
+        success = normalize_timestamp(item.get("last_success_at"))
+        latest = normalize_timestamp(item.get("latest_published_at"))
+        now = utc_now()
+        values = (
+            source_id, source_name, str(item.get("kind") or "rss"),
+            str(item.get("status") or "unknown"), attempted, success, latest,
+            max(0, int(item.get("article_count") or 0)),
+            max(0, int(item.get("relevant_count") or 0)),
+            max(0, int(item.get("latency_ms") or 0)) if item.get("latency_ms") is not None else None,
+            str(item.get("error"))[:1000] if item.get("error") else None,
+            json.dumps(json_safe(dict(item.get("metadata") or {})), ensure_ascii=True),
+            now, now,
+        )
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO news_source_health (
+                       source_id,source_name,kind,status,last_attempt_at,last_success_at,
+                       latest_published_at,article_count,relevant_count,latency_ms,error,
+                       metadata_json,created_at,updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(source_id) DO UPDATE SET
+                       source_name=excluded.source_name,kind=excluded.kind,status=excluded.status,
+                       last_attempt_at=excluded.last_attempt_at,
+                       last_success_at=COALESCE(excluded.last_success_at,news_source_health.last_success_at),
+                       latest_published_at=COALESCE(excluded.latest_published_at,
+                                                   news_source_health.latest_published_at),
+                       article_count=excluded.article_count,relevant_count=excluded.relevant_count,
+                       latency_ms=excluded.latency_ms,error=excluded.error,
+                       metadata_json=excluded.metadata_json,updated_at=excluded.updated_at""",
+                values,
+            )
+            row = connection.execute(
+                "SELECT * FROM news_source_health WHERE source_id=?", (source_id,),
+            ).fetchone()
+        return self._record(row)
+
+    def news_source_health(self) -> List[Dict[str, Any]]:
+        with self._reader() as connection:
+            rows = connection.execute(
+                """SELECT * FROM news_source_health
+                   ORDER BY CASE status WHEN 'healthy' THEN 0 WHEN 'empty' THEN 1 ELSE 2 END,
+                            source_name"""
+            ).fetchall()
+        return [self._record(row) for row in rows]
 
     def start_run(self, source: str, scope: str = "all",
                   metadata: Optional[Mapping[str, Any]] = None,
@@ -1062,6 +1189,158 @@ class LpgStore:
         return json_safe({"dataset": dataset, "columns": columns, "rows": flat_rows,
                           "total": total, "limit": limit, "offset": offset})
 
+    def dataset_health(self) -> Dict[str, Dict[str, Any]]:
+        """Return stable, entitlement-gated coverage metrics by LPG dataset.
+
+        ``observations`` stores both the current snapshot and accumulated
+        history, so those two health rows deliberately use different views of
+        the same table: current is the latest effective BATE per series while
+        history counts one preferred BATE per series/date.
+        """
+        with self._reader() as connection:
+            current = connection.execute(
+                f"""WITH ranked AS (
+                        SELECT o.series_id,o.observation_date,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY o.series_id
+                                   ORDER BY o.observation_date DESC,
+                                            {BATE_PRIORITY_SQL},
+                                            o.publication_time DESC,o.id DESC
+                               ) row_rank
+                        FROM observations o
+                        JOIN series_catalog s ON s.id=o.series_id
+                        WHERE s.active=1 AND s.entitlement_state='entitled'
+                    )
+                    SELECT COUNT(*) rows,COUNT(DISTINCT observation_date) dates,
+                           COUNT(DISTINCT series_id) series,
+                           MIN(observation_date) first_date,
+                           MAX(observation_date) last_date
+                    FROM ranked WHERE row_rank=1"""
+            ).fetchone()
+            history = connection.execute(
+                f"""WITH preferred AS (
+                        SELECT o.series_id,o.observation_date,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY o.series_id,o.observation_date
+                                   ORDER BY {BATE_PRIORITY_SQL},
+                                            o.publication_time DESC,o.id DESC
+                               ) bate_rank
+                        FROM observations o
+                        JOIN series_catalog s ON s.id=o.series_id
+                        WHERE s.active=1 AND s.entitlement_state='entitled'
+                    ), effective AS (
+                        SELECT series_id,observation_date
+                        FROM preferred WHERE bate_rank=1
+                    ), coverage AS (
+                        SELECT series_id,COUNT(*) date_count
+                        FROM effective GROUP BY series_id
+                    )
+                    SELECT (SELECT COUNT(*) FROM effective) rows,
+                           (SELECT COUNT(DISTINCT observation_date) FROM effective) dates,
+                           (SELECT COUNT(*) FROM coverage) series,
+                           (SELECT COUNT(*) FROM coverage WHERE date_count>1) multi_date_series,
+                           (SELECT MIN(observation_date) FROM effective) first_date,
+                           (SELECT MAX(observation_date) FROM effective) last_date"""
+            ).fetchone()
+            official_curves = connection.execute(
+                """SELECT COUNT(*) rows,COUNT(DISTINCT p.as_of_date) dates,
+                          COUNT(DISTINCT p.series_id) series,
+                          MIN(p.as_of_date) first_date,MAX(p.as_of_date) last_date
+                   FROM curve_points p
+                   JOIN series_catalog s ON s.id=p.series_id
+                   WHERE s.active=1 AND s.entitlement_state='entitled'"""
+            ).fetchone()
+            dataset_rows = connection.execute(
+                """SELECT dataset,row_key,as_of_date,payload_json
+                   FROM dataset_rows
+                   WHERE dataset IN ('platts_ewindow','platts_fundamentals')"""
+            ).fetchall()
+
+        def metric(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+            raw = dict(row) if row is not None else {}
+            return {
+                "rows": int(raw.get("rows") or 0),
+                "dates": int(raw.get("dates") or 0),
+                "series": int(raw.get("series") or 0),
+                "first_date": raw.get("first_date"),
+                "last_date": raw.get("last_date"),
+            }
+
+        current_metric = metric(current)
+        current_metric.update({
+            "status": "ready" if current_metric["rows"] else "empty",
+            "reason": None if current_metric["rows"] else "no_entitled_current_observations",
+        })
+
+        history_metric = metric(history)
+        history_metric["multi_date_series"] = int(
+            dict(history).get("multi_date_series") or 0
+        ) if history is not None else 0
+        if not history_metric["rows"]:
+            history_metric.update({
+                "status": "empty", "reason": "no_entitled_history_observations",
+            })
+        elif not history_metric["multi_date_series"]:
+            history_metric.update({
+                "status": "limited", "reason": "single_date_only",
+            })
+        elif history_metric["multi_date_series"] < history_metric["series"]:
+            history_metric.update({
+                "status": "partial", "reason": "some_series_have_single_date_only",
+            })
+        else:
+            history_metric.update({"status": "ready", "reason": None})
+
+        curve_metric = metric(official_curves)
+        curve_metric.update({
+            "official_rows": curve_metric["rows"],
+            "official_series": curve_metric["series"],
+            "status": "ready" if curve_metric["rows"] else "empty",
+            "reason": None if curve_metric["rows"] else "no_official_curve_points",
+        })
+
+        supplemental: Dict[str, Dict[str, Any]] = {
+            "platts_ewindow": {"rows": 0, "dates": set(), "series": set()},
+            "platts_fundamentals": {"rows": 0, "dates": set(), "series": set()},
+        }
+        for row in dataset_rows:
+            bucket = supplemental[row["dataset"]]
+            bucket["rows"] += 1
+            bucket["dates"].add(row["as_of_date"])
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, Mapping):
+                identity = (payload.get("series_id") or payload.get("data_series") or
+                            payload.get("symbol"))
+                if identity not in (None, ""):
+                    bucket["series"].add(str(identity))
+
+        def supplemental_metric(dataset: str, reason: str) -> Dict[str, Any]:
+            raw = supplemental[dataset]
+            dates = sorted(raw["dates"])
+            rows = int(raw["rows"])
+            return {
+                "rows": rows,
+                "dates": len(dates),
+                "series": len(raw["series"]),
+                "first_date": dates[0] if dates else None,
+                "last_date": dates[-1] if dates else None,
+                "status": "ready" if rows else "empty",
+                "reason": None if rows else reason,
+            }
+
+        return json_safe({
+            "current": current_metric,
+            "history": history_metric,
+            "curves": curve_metric,
+            "moc": supplemental_metric("platts_ewindow", "no_moc_rows"),
+            "fundamentals": supplemental_metric(
+                "platts_fundamentals", "no_fundamentals_rows",
+            ),
+        })
+
     def status(self) -> Dict[str, Any]:
         with self._reader() as connection:
             states = {row["entitlement_state"]: row["count"] for row in connection.execute(
@@ -1108,7 +1387,9 @@ class LpgStore:
                          "size_bytes": db_size},
             "catalog": {"total": sum(states.values()), "states": states},
             "candidates": {"total": sum(candidate_states.values()), "states": candidate_states},
+            "datasets": self.dataset_health(),
             "sources": sources,
+            "news_sources": self.news_source_health(),
             "runs": self.recent_runs(20),
             "updated_at": utc_now(),
         }

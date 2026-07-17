@@ -10,9 +10,11 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from .models import json_safe
 from .news_sources import (
@@ -22,8 +24,9 @@ from .news_sources import (
     to_news_input,
 )
 from .platts_excel import (
-    STAGING_DIR,
     build_backfill_workbooks,
+    build_curve_workbooks,
+    build_moc_workbooks,
     build_scope_workbooks,
     combine_payloads,
     parse_workbook,
@@ -143,33 +146,266 @@ class LpgRefreshWorkflow:
             "message": "entitlement_discovery_only" if record_count == 0 else None,
         })
 
+    @staticmethod
+    def _workbook_scope(workbook: Path) -> str:
+        name = workbook.name.lower()
+        if "_overnight" in name:
+            return "overnight"
+        if "_asia" in name:
+            return "asia"
+        raise ValueError(f"cannot determine LPG scope from workbook name: {workbook.name}")
+
+    @staticmethod
+    def _aggregate_states(results: Sequence[Mapping[str, Any]]) -> str:
+        states = [str(item.get("state") or "failed") for item in results]
+        if states and all(state == "succeeded" for state in states):
+            return "succeeded"
+        if any(state in {"succeeded", "partial"} for state in states):
+            return "partial"
+        if states and all(state == "deferred" for state in states):
+            return "deferred"
+        return "failed"
+
+    def _refresh_specialized_workbooks(
+        self,
+        workbooks: Sequence[Path],
+        *,
+        purpose: str,
+        timeout_seconds: int,
+        year: int | None = None,
+    ) -> Dict[str, Any]:
+        """Refresh, parse, stage, and import independent licensed-data batches."""
+        results: list[dict[str, Any]] = []
+        for workbook in workbooks:
+            item_scope = self._workbook_scope(workbook)
+            result = self._excel_refresh(workbook, timeout_seconds)
+            result.update({
+                "scope": item_scope,
+                "workbook": str(workbook),
+                "purpose": purpose,
+                "year": year,
+            })
+            if result["state"] != "succeeded":
+                write_runtime_status(
+                    scope=item_scope,
+                    state=result["state"],
+                    reason_code=str(result.get("reason") or "excel_refresh_failed"),
+                    purpose=purpose,
+                )
+                results.append(result)
+                continue
+
+            try:
+                payload = parse_workbook(workbook)
+                result["records"] = len(payload.get("records") or [])
+                result["entitlements"] = len(payload.get("entitlement_results") or [])
+                staged = write_staging(
+                    payload,
+                    purpose=purpose,
+                    year=year,
+                    batch_id=workbook.stem,
+                )
+                if staged is None:
+                    result.update({
+                        "state": "failed",
+                        "reason": "empty_workbook_payload",
+                    })
+                else:
+                    imported = self.service.import_platts_staging(staged)
+                    result["staging"] = str(staged)
+                    result["import"] = imported
+                    if imported.get("status") == "failed":
+                        result.update({"state": "failed", "reason": "staging_import_failed"})
+                    elif imported.get("status") == "partial" or not result["records"]:
+                        result["state"] = "partial"
+                        result["reason"] = "no_data_returned" if not result["records"] else None
+            except Exception as exc:
+                # One failed symbol/curve is isolated; successful batches have
+                # already been durably imported and can be skipped by upsert on retry.
+                result.update({
+                    "state": "failed",
+                    "reason": "workbook_pipeline_failed",
+                    "error": str(exc)[:1000],
+                })
+            results.append(result)
+
+        return json_safe({
+            "state": self._aggregate_states(results),
+            "purpose": purpose,
+            "year": year,
+            "results": results,
+            "workbook_count": len(workbooks),
+            "record_count": sum(int(item.get("records") or 0) for item in results),
+            "message": "no_workbooks_configured" if not workbooks else None,
+        })
+
+    def refresh_history(
+        self,
+        *,
+        start_year: int | None = None,
+        end_year: int | None = None,
+        scope: str = "all",
+        symbols: Sequence[str] | None = None,
+        batch_size: int = 1,
+        timeout_seconds: int = 240,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Run retryable History-Symbol backfill batches through SQLite import."""
+        first_year = start_year or datetime.now(timezone.utc).year
+        last_year = end_year or first_year
+        if first_year > last_year:
+            raise ValueError("start_year must be <= end_year")
+        yearly: list[dict[str, Any]] = []
+        for year in range(first_year, last_year + 1):
+            workbooks = build_backfill_workbooks(
+                start_year=year,
+                end_year=year,
+                scope=scope,
+                symbols=symbols,
+                batch_size=batch_size,
+                force=force,
+            )
+            yearly.append(self._refresh_specialized_workbooks(
+                workbooks,
+                purpose="backfill",
+                timeout_seconds=timeout_seconds,
+                year=year,
+            ))
+        results = [item for run in yearly for item in (run.get("results") or [])]
+        return json_safe({
+            "state": self._aggregate_states(results),
+            "purpose": "history",
+            "scope": scope,
+            "start_year": first_year,
+            "end_year": last_year,
+            "symbols": list(symbols or []),
+            "batch_size": batch_size,
+            "record_count": sum(int(item.get("records") or 0) for item in results),
+            "results": results,
+        })
+
+    def refresh_curves(
+        self,
+        *,
+        scope: str = "all",
+        curve_ids: Sequence[str] | None = None,
+        batch_size: int = 1,
+        timeout_seconds: int = 240,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        workbooks = build_curve_workbooks(
+            scope=scope,
+            curve_ids=curve_ids,
+            batch_size=batch_size,
+            force=force,
+        )
+        output = self._refresh_specialized_workbooks(
+            workbooks, purpose="curve", timeout_seconds=timeout_seconds,
+        )
+        output.update({"scope": scope, "curve_ids": list(curve_ids or [])})
+        return json_safe(output)
+
+    def refresh_moc(
+        self,
+        *,
+        scope: str = "all",
+        timeout_seconds: int = 240,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        workbooks = build_moc_workbooks(scope=scope, force=force)
+        output = self._refresh_specialized_workbooks(
+            workbooks, purpose="moc", timeout_seconds=timeout_seconds,
+        )
+        output.update({
+            "scope": scope,
+            "dataset": "platts_ewindow",
+            "fundamentals": {
+                "state": "unavailable",
+                "reason": "no_reliable_licensed_source_configured",
+            },
+        })
+        return json_safe(output)
+
     def refresh_news(self, limit: int = 100) -> Dict[str, Any]:
         run = self.service.start_run("lpg_news", "news", metadata={"limit": limit})
-        errors, articles = [], []
+        errors, warnings, articles, source_health = [], [], [], []
         official = PlattsNewsClient()
-        if official.configured:
+        if not official.configured:
+            warnings.append("platts_news_api_not_configured")
+
+        def fetch_official() -> Dict[str, Any]:
+            started = time.perf_counter()
+            attempted = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             try:
-                payload = official.fetch(page_size=min(max(limit, 20), 500))
-                articles.extend(payload.get("articles") or [])
-                if payload.get("error"):
-                    errors.append(str(payload["error"]))
+                payload = official.fetch(
+                    page_size=min(max(limit, 20), 500),
+                    max_pages=max(1, min(5, (max(limit, 20) + 99) // 100)),
+                )
+                rows = payload.get("articles") or []
+                latest = max((row.get("published_at") for row in rows), default=None)
+                health = {
+                    "source_id": "platts_news_api",
+                    "source_name": "S&P Global Commodity Insights",
+                    "kind": "licensed_api", "status": "healthy" if rows else "empty",
+                    "last_attempt_at": attempted, "last_success_at": attempted,
+                    "latest_published_at": latest, "article_count": len(rows),
+                    "relevant_count": sum(bool(row.get("is_relevant")) for row in rows),
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                    "error": payload.get("error"),
+                    "metadata": {"content_boundary": "separate_machine_readable_entitlement"},
+                }
+                return {"kind": "official", "payload": payload, "health": health}
             except Exception as exc:
-                errors.append(f"platts_news_api: {exc}")
-        else:
-            errors.append("platts_news_api_not_configured")
-        try:
-            public = public_lpg_news(limit=limit)
-            articles.extend(public.get("articles") or [])
-            if public.get("error"):
-                errors.append(str(public["error"]))
-        except Exception as exc:
-            errors.append(f"public_news: {exc}")
+                return {"kind": "official", "error": str(exc), "health": {
+                    "source_id": "platts_news_api",
+                    "source_name": "S&P Global Commodity Insights",
+                    "kind": "licensed_api", "status": "error",
+                    "last_attempt_at": attempted, "last_success_at": None,
+                    "article_count": 0, "relevant_count": 0,
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                    "error": str(exc),
+                    "metadata": {"content_boundary": "separate_machine_readable_entitlement"},
+                }}
+
+        def fetch_public() -> Dict[str, Any]:
+            try:
+                return {"kind": "public", "payload": public_lpg_news(limit=max(limit * 2, 160))}
+            except Exception as exc:
+                return {"kind": "public", "error": str(exc)}
+
+        jobs = [fetch_public]
+        if official.configured:
+            jobs.append(fetch_official)
+        with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="lpg-news-provider") as executor:
+            futures = [executor.submit(job) for job in jobs]
+            for future in as_completed(futures):
+                result = future.result()
+                if result.get("health"):
+                    source_health.append(result["health"])
+                if result.get("error"):
+                    errors.append(f"{result['kind']}_news: {result['error']}")
+                    continue
+                payload = result.get("payload") or {}
+                articles.extend(payload.get("articles") or [])
+                if result["kind"] == "public":
+                    source_health.extend(payload.get("sources") or [])
+                if payload.get("error"):
+                    errors.append(f"{result['kind']}_news: {payload['error']}")
+
+        for health in source_health:
+            try:
+                self.service.upsert_news_source_health(health)
+            except Exception as exc:
+                errors.append(f"news_source_health: {exc}")
 
         counts = {"rows_seen": len(articles), "rows_inserted": 0,
                   "rows_updated": 0, "rows_skipped": 0}
-        for article in dedupe_articles(articles):
+        ranked = dedupe_articles(article for article in articles if article.get("is_relevant"))
+        for article in ranked:
             try:
-                saved = self.service.upsert_news(to_news_input(article))
+                record = to_news_input(article)
+                record["ingestion_run_id"] = run["id"]
+                saved = self.service.upsert_news(record)
                 if saved.get("action") == "inserted":
                     counts["rows_inserted"] += 1
                 else:
@@ -178,9 +414,18 @@ class LpgRefreshWorkflow:
                 counts["rows_skipped"] += 1
                 errors.append(f"news_record: {exc}")
         wrote = counts["rows_inserted"] + counts["rows_updated"]
+        provider_available = any(
+            health.get("status") in {"healthy", "empty"} for health in source_health
+        )
         if wrote and errors:
             status, state = "partial", "partial"
         elif wrote:
+            status, state = "success", "succeeded"
+        elif provider_available and errors:
+            status, state = "partial", "partial"
+        elif provider_available:
+            # A quiet LPG news window is a valid empty snapshot, not a failed
+            # ingestion. Source health carries the distinction to the UI.
             status, state = "success", "succeeded"
         else:
             status, state = "failed", "failed"
@@ -189,12 +434,50 @@ class LpgRefreshWorkflow:
             error="; ".join(errors[:20]) if errors else None,
         )
         return json_safe({"state": state, "run": finished, "counts": counts,
-                          "errors": errors})
+                          "errors": errors, "warnings": warnings,
+                          "source_health": source_health,
+                          "clusters": len({row.get("cluster_key") for row in ranked
+                                           if row.get("cluster_key")}),
+                          "message": "no_relevant_headlines" if not ranked else None,
+                          "entitlement_boundary": {
+                              "platts": "separate_machine_readable_api_only",
+                              "public": "publisher_attributed_discovery_no_sla",
+                          }})
 
-    def refresh(self, scope: str = "all", timeout_seconds: int = 240) -> Dict[str, Any]:
+    def refresh(
+        self,
+        scope: str = "all",
+        timeout_seconds: int = 240,
+        *,
+        symbols: Sequence[str] | None = None,
+        curve_ids: Sequence[str] | None = None,
+        market_scope: str = "all",
+        batch_size: int | None = None,
+    ) -> Dict[str, Any]:
         scope = str(scope or "all").lower()
         if scope == "news":
             return self.refresh_news()
+        if scope == "history":
+            # Server/UI refreshes intentionally cover only the current year.
+            # Multi-year backfills remain an explicit CLI operation.
+            return self.refresh_history(
+                scope=market_scope,
+                symbols=symbols,
+                batch_size=batch_size or (1 if symbols else 5),
+                timeout_seconds=max(timeout_seconds, 600),
+            )
+        if scope in {"curve", "curves"}:
+            return self.refresh_curves(
+                scope=market_scope,
+                curve_ids=curve_ids,
+                batch_size=batch_size or 4,
+                timeout_seconds=max(timeout_seconds, 600),
+            )
+        if scope == "moc":
+            return self.refresh_moc(
+                scope=market_scope,
+                timeout_seconds=max(timeout_seconds, 600),
+            )
         market = self.refresh_market(scope, timeout_seconds=timeout_seconds)
         if scope != "all":
             return market
@@ -210,14 +493,49 @@ class LpgRefreshWorkflow:
             state = "failed"
         return json_safe({"state": state, "scope": scope, "market": market, "news": news})
 
-    def build_backfill(self, start_year: int, end_year: int,
-                       scope: str = "all", force: bool = False) -> Dict[str, Any]:
+    def build_backfill(
+        self,
+        start_year: int,
+        end_year: int,
+        scope: str = "all",
+        symbols: Sequence[str] | None = None,
+        batch_size: int = 1,
+        force: bool = False,
+    ) -> Dict[str, Any]:
         paths = build_backfill_workbooks(
-            start_year=start_year, end_year=end_year, scope=scope, force=force,
+            start_year=start_year,
+            end_year=end_year,
+            scope=scope,
+            symbols=symbols,
+            batch_size=batch_size,
+            force=force,
         )
         return {"state": "succeeded", "scope": scope,
                 "start_year": start_year, "end_year": end_year,
+                "symbols": list(symbols or []), "batch_size": batch_size,
                 "workbooks": [str(path) for path in paths]}
+
+    def build_curves(
+        self,
+        *,
+        scope: str = "all",
+        curve_ids: Sequence[str] | None = None,
+        batch_size: int = 1,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        paths = build_curve_workbooks(
+            scope=scope, curve_ids=curve_ids, batch_size=batch_size, force=force,
+        )
+        return {"state": "succeeded" if paths else "failed", "scope": scope,
+                "curve_ids": list(curve_ids or []), "batch_size": batch_size,
+                "workbooks": [str(path) for path in paths]}
+
+    def build_moc(self, *, scope: str = "all", force: bool = False) -> Dict[str, Any]:
+        paths = build_moc_workbooks(scope=scope, force=force)
+        return {"state": "succeeded", "scope": scope,
+                "workbooks": [str(path) for path in paths],
+                "fundamentals": {"state": "unavailable",
+                                 "reason": "no_reliable_licensed_source_configured"}}
 
 
 def default_workflow() -> LpgRefreshWorkflow:

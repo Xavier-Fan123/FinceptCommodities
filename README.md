@@ -36,8 +36,9 @@ LPG trader:
 - **History & Seasonality** — long history, statistics, monthly returns,
   seasonal bands, BATE selection, and correction counts.
 - **MOC & Fundamentals** — entitlement-aware eWindow/MOC and dataset rows.
-- **News** — official API content when separately configured, plus clearly
-  labelled public fallback news and trader tags.
+- **News** — a live LPG newsroom with relevance/freshness ranking, confirmed
+  vs developing breaking rules, event clustering and related coverage,
+  source-health telemetry, and clearly labelled licensed/public boundaries.
 - **Data Explorer** — filtered series, observations, curves, revisions,
   candidates, news, spreads, and ingestion runs.
 - **Data Status** — the complete entitlement matrix, source/session health,
@@ -138,16 +139,17 @@ API (all JSON, all local):
 /api/lpg/series/{id}/history
 /api/lpg/curves
 /api/lpg/spreads
-/api/lpg/news
+/api/lpg/news[?q=...][&region=asia][&importance=high][&fresh=1]
 /api/lpg/explorer
 /api/lpg/status
 /api/lpg/refresh/{job_id}
 /api/lpg/export?view=...&format=csv|xlsx
 ```
 
-`POST /api/lpg/refresh` starts a single-flight asynchronous job with scope
-`asia`, `overnight`, `news`, or `all`. A second refresh receives HTTP 409 with
-the active job rather than starting another Excel instance.
+`POST /api/lpg/refresh` starts a single-flight asynchronous job. Current-data
+scopes are `asia`, `overnight`, `news`, and `all`; the isolated dataset scopes
+are `history`, `curves`, and `moc`. A second refresh receives HTTP 409 with the
+active job rather than starting another Excel instance.
 
 ## Licensed LPG setup
 
@@ -163,6 +165,16 @@ python -m lpg.cli build --scope all
 python -m lpg.cli refresh --scope asia
 python -m lpg.cli refresh --scope overnight
 
+# Backfill history in deterministic per-symbol/per-year workbooks.
+# Start with one known entitled symbol; add more --symbol values as needed.
+python -m lpg.cli refresh-history --start-year 2026 --end-year 2026 --scope asia --symbol PMAAV00 --batch-size 1 --timeout 600
+
+# Query official FC CurveData independently from the current-price workbooks
+python -m lpg.cli refresh-curves --scope asia --curve CN3HO --batch-size 1 --timeout 600
+
+# Query Platts eWindow/MOC independently
+python -m lpg.cli refresh-moc --scope asia --timeout 600
+
 # Inspect the entitlement/source matrix
 python -m lpg.cli status
 ```
@@ -171,16 +183,24 @@ Private artifacts are under `data/private/platts/` and
 `data/private/lpg.sqlite`. Each symbol/curve is queried independently, so one
 unentitled code cannot invalidate an entitled batch. A failed/expired Excel
 session does not replace the last-good staging file or observations.
+The History page refreshes the currently selected entitled symbol instead of
+launching every catalog symbol. Longer Excel jobs remain tracked in the
+background, and a stable Add-in formula/session error is written to dataset
+status and returned promptly instead of appearing as an empty chart.
 Generated workbooks use manual calculation and the refresh runner dispatches
 each isolated Add-in formula once; this prevents volatile async UDFs from
 repeating completed requests. Current prices, history, forward curves, eWindow,
 and news are separate entitlements, and unavailable datasets stay visibly empty
-rather than being estimated or synthesized.
+rather than being silently estimated. When official FC points are absent, the
+Curve view may show an explicitly labelled non-official prompt structure
+calculated only from the entitled HM1/HM2/HM3 price series; it never presents
+that structure as Platts CurveData.
 
-Yearly backfill workbooks are resumable and built explicitly:
+Yearly backfill workbooks are resumable and can also be built without opening
+Excel:
 
 ```powershell
-python -m lpg.cli build-backfill --start-year 2021 --end-year 2026 --scope all
+python -m lpg.cli build-backfill --start-year 2021 --end-year 2026 --scope all --batch-size 1
 ```
 
 Review scheduler configuration without changing Windows:
@@ -192,7 +212,13 @@ powershell -File scripts\Install-LpgScheduledTasks.ps1 -DryRun
 Install only after the dry run is correct. The tasks run for the interactive
 user at 08:00 (overnight/US legs) and 17:30 Singapore time (Asia close). If
 Excel is open, the refresh defers without taking focus; the trigger retries
-every 15 minutes for up to two hours.
+every 15 minutes for up to two hours. After the first usable refresh that day,
+later retry triggers exit without reopening Excel. Excel itself starts as a
+normal visible desktop window long enough for the official Add-in to restore
+its remembered sign-in, then the runner minimizes and automates it. If a manual
+refresh is started from an Administrator Terminal, the workbook runner
+automatically re-dispatches at the interactive user's Limited integrity so the
+per-user S&P ribbon and session remain available.
 
 ```powershell
 powershell -File scripts\Install-LpgScheduledTasks.ps1 -Install
@@ -202,6 +228,20 @@ Machine-readable Platts news is a separate entitlement from Excel. Copy
 `.env.example` to a private `.env` and populate only the endpoint/OAuth fields
 supplied with the API contract. When it is not configured, the system reports
 the gap and uses public LPG news; it does not scrape Platts Connect.
+
+The public newsroom concurrently checks focused Google News discovery queries,
+rotating GDELT DOC 2.0 regional discovery, Saudi Aramco, EIA and NHC feeds. It
+persists per-source latency/error/last-success health and filters consumer LPG
+noise before storing a headline. GDELT queries are deliberately rotated rather
+than burst concurrently to respect its public service rate guidance. Public
+feeds have no production SLA and never masquerade as licensed Platts content.
+Set `LPG_NEWS_FEEDS_JSON` only for additional RSS/Atom feeds you are permitted
+to ingest.
+
+While the local server is running, the persisted LPG news snapshot refreshes in
+the background every two minutes. The visible News tab checks every 60 seconds
+and follows an active refresh job every 10 seconds. A failed source is isolated;
+last-good headlines remain available and its error is shown in Source Health.
 
 Append `&fresh=1` (or `?fresh=1`) to bypass the cache — the ↻ button does
 this for the active view.
@@ -215,8 +255,11 @@ warm-up so the first page paint hits a warm cache.
 Public data sources:
 - **Yahoo Finance** (key-less) — continuous-contract quotes/history and dated
   contracts (e.g. `CLN26.NYM`) for building the futures curve
-- **Public news feeds** (key-less) - Google News RSS, Yahoo Finance RSS, and
-  EIA Today in Energy RSS for the energy and petrochemicals news workspace
+- **Public news discovery/feeds** (key-less) - focused Google News discovery,
+  rotating GDELT DOC 2.0 queries, Saudi Aramco, EIA and NHC for the LPG
+  newsroom; Google News RSS, Yahoo Finance RSS and EIA for the broader energy
+  workspace. Publisher copyright remains with the publisher; the LPG store
+  keeps attributed metadata/link/available feed summary, not scraped articles.
 - **CFTC public reporting API** (key-less) — Commitments of Traders
   positioning (disaggregated report; contract codes verified against the live
   dataset, including Brent `06765T` and Henry Hub `023651`)

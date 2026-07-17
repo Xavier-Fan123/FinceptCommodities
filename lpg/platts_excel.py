@@ -26,6 +26,7 @@ PRIVATE_DIR = ROOT / "data" / "private" / "platts"
 STAGING_DIR = PRIVATE_DIR / "staging"
 
 VALID_SCOPES = {"asia", "overnight", "all"}
+VALID_PURPOSES = {"daily", "backfill", "curve", "moc"}
 ERROR_VALUES = {"#VALUE!", "#N/A", "#REF!", "#NAME?", "#NUM!", "#NULL!", "#DIV/0!"}
 BATE_ORDER = {"c": 0, "u": 1, "e": 2, "l": 3, "h": 4}
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{5,10}$")
@@ -206,15 +207,30 @@ def curves_for_scope(scope: str) -> tuple[CurveCandidate, ...]:
     return tuple(c for c in CURVE_CANDIDATES if scope == "all" or c.scope == scope)
 
 
-def workbook_path(scope: str, *, purpose: str = "daily", year: int | None = None) -> Path:
+def workbook_path(
+    scope: str,
+    *,
+    purpose: str = "daily",
+    year: int | None = None,
+    batch_id: str | None = None,
+) -> Path:
     _validate_scope(scope)
     if scope == "all":
         raise ValueError("'all' uses the asia and overnight workbooks; it has no single workbook")
+    if purpose not in VALID_PURPOSES:
+        raise ValueError(f"purpose must be one of {sorted(VALID_PURPOSES)}")
+    suffix = f"_{_safe_slug(batch_id)}" if batch_id else ""
     if purpose == "daily":
         return PRIVATE_DIR / f"Platts_LPG_{scope}.xlsx"
     if purpose == "backfill" and year is not None:
-        return PRIVATE_DIR / "backfill" / f"Platts_LPG_{scope}_{year}.xlsx"
-    raise ValueError("backfill workbooks require a year")
+        return PRIVATE_DIR / "backfill" / f"Platts_LPG_{scope}_{year}{suffix}.xlsx"
+    if purpose == "curve" and year is None:
+        return PRIVATE_DIR / "curves" / f"Platts_LPG_FC_{scope}{suffix}.xlsx"
+    if purpose == "moc" and year is None:
+        return PRIVATE_DIR / "moc" / f"Platts_LPG_MOC_{scope}{suffix}.xlsx"
+    if purpose == "backfill":
+        raise ValueError("backfill workbooks require a year")
+    raise ValueError(f"{purpose} workbooks do not accept a year")
 
 
 def build_workbook(
@@ -226,21 +242,26 @@ def build_workbook(
     force: bool = False,
     include_discovery: bool = True,
     candidate_ids: Sequence[str] | None = None,
+    curve_candidate_ids: Sequence[str] | None = None,
     query_kinds: Sequence[str] | None = None,
-    include_ewindow: bool = True,
+    include_curves: bool = False,
+    include_ewindow: bool = False,
 ) -> Path:
     """Build an Add-in workbook without starting Excel or storing credentials."""
     _validate_scope(scope)
     if scope == "all":
         raise ValueError("build one workbook per concrete scope")
-    if purpose not in {"daily", "backfill"}:
-        raise ValueError("purpose must be daily or backfill")
+    if purpose not in VALID_PURPOSES:
+        raise ValueError(f"purpose must be one of {sorted(VALID_PURPOSES)}")
     if purpose == "backfill" and year is None:
         raise ValueError("backfill workbook requires year")
     if year is not None and not 1990 <= year <= 2200:
         raise ValueError("year is outside the supported range")
     selected_ids = set(candidate_ids) if candidate_ids is not None else None
-    selected_kinds = set(query_kinds or ("current", "history", "correction"))
+    selected_curve_ids = set(curve_candidate_ids) if curve_candidate_ids is not None else None
+    selected_kinds = set(
+        query_kinds if query_kinds is not None else ("current", "history", "correction")
+    )
     if not selected_kinds <= {"current", "history", "correction"}:
         raise ValueError("query_kinds contains an unsupported market-data query")
 
@@ -295,15 +316,16 @@ def build_workbook(
             candidate.currency, candidate.uom, candidate.enabled,
             "pending_review" if not candidate.symbol else "pending_test",
         ])
-    for curve in curves_for_scope(scope):
-        if selected_ids is not None and curve.candidate_id not in selected_ids:
-            continue
-        catalog.append([
-            curve.candidate_id, canonical_key(curve.candidate_id), curve.series_id,
-            curve.label, curve.scope,
-            curve.query_group, curve.basis, curve.search_terms, curve.curve_code,
-            curve.currency, curve.uom, curve.enabled, "pending_test",
-        ])
+    if include_curves:
+        for curve in curves_for_scope(scope):
+            if selected_curve_ids is not None and curve.candidate_id not in selected_curve_ids:
+                continue
+            catalog.append([
+                curve.candidate_id, canonical_key(curve.candidate_id), curve.series_id,
+                curve.label, curve.scope,
+                curve.query_group, curve.basis, curve.search_terms, curve.curve_code,
+                curve.currency, curve.uom, curve.enabled, "pending_test",
+            ])
 
     manifest = wb.create_sheet("_query_manifest")
     manifest_headers = [f.name for f in QuerySpec.__dataclass_fields__.values()]
@@ -316,6 +338,8 @@ def build_workbook(
     runtime.append(["refreshed_at", ""])
     runtime.append(["resolved_queries", 0])
     runtime.append(["resolved_discovery", 0])
+    runtime.append(["purpose", purpose])
+    runtime.append(["year", year or ""])
     runtime.append(["message", "Workbook has not been calculated by the official Add-in yet."])
     runtime.sheet_state = "veryHidden"
 
@@ -360,6 +384,8 @@ def build_workbook(
     for candidate in candidates_for_scope(scope):
         if selected_ids is not None and candidate.candidate_id not in selected_ids:
             continue
+        if purpose in {"curve", "moc"}:
+            continue
         if not candidate.enabled or not candidate.symbol:
             continue
         if purpose == "backfill":
@@ -393,20 +419,21 @@ def build_workbook(
                 currency=candidate.currency, uom=candidate.uom,
             ), formula)
 
-    for curve in curves_for_scope(scope):
-        if selected_ids is not None and curve.candidate_id not in selected_ids:
-            continue
-        if not curve.enabled or not curve.curve_code:
-            continue
-        sheet = f"q{qnum:03d}_curve"
-        formula = _curve_formula(curve.curve_code, year=year if purpose == "backfill" else None)
-        add_spec(QuerySpec(
-            f"{curve.candidate_id}:curve:{year or 'rolling'}", sheet, curve.candidate_id,
-            canonical_key(curve.candidate_id), curve.series_id, curve.label,
-            "FC", "CurveData", "curve", curve.scope,
-            curve.query_group, curve_code=curve.curve_code, basis=curve.basis,
-            currency=curve.currency, uom=curve.uom, year=year,
-        ), formula)
+    if include_curves:
+        for curve in curves_for_scope(scope):
+            if selected_curve_ids is not None and curve.candidate_id not in selected_curve_ids:
+                continue
+            if not curve.enabled or not curve.curve_code:
+                continue
+            sheet = f"q{qnum:03d}_curve"
+            formula = _curve_formula(curve.curve_code, year=year if purpose == "backfill" else None)
+            add_spec(QuerySpec(
+                f"{curve.candidate_id}:curve:{year or 'rolling'}", sheet, curve.candidate_id,
+                canonical_key(curve.candidate_id), curve.series_id, curve.label,
+                "FC", "CurveData", "curve", curve.scope,
+                curve.query_group, curve_code=curve.curve_code, basis=curve.basis,
+                currency=curve.currency, uom=curve.uom, year=year,
+            ), formula)
 
     ewindow_filters = _ewindow_filters(scope, purpose=purpose, year=year) if include_ewindow else ()
     for group, filter_text in ewindow_filters:
@@ -454,7 +481,8 @@ def build_scope_workbooks(*, scope: str = "all", force: bool = False) -> list[Pa
         )
         paths.append(build_workbook(
             workbook_path(item), scope=item, force=force, include_discovery=False,
-            candidate_ids=selected, query_kinds=("current",), include_ewindow=False,
+            candidate_ids=selected, query_kinds=("current",), include_curves=False,
+            include_ewindow=False,
         ))
     return paths
 
@@ -473,32 +501,175 @@ def build_probe_workbook(*, symbol: str = "PMAAV00", force: bool = True) -> Path
         include_discovery=False,
         candidate_ids=(candidate.candidate_id,),
         query_kinds=("current",),
+        include_curves=False,
         include_ewindow=False,
     )
 
 
+def _resolve_candidate_ids(
+    values: Sequence[str] | None, *, scope: str,
+) -> set[str] | None:
+    if values is None:
+        return None
+    lookup: dict[str, str] = {}
+    for candidate in candidates_for_scope(scope):
+        lookup[candidate.candidate_id.lower()] = candidate.candidate_id
+        if candidate.symbol:
+            lookup[candidate.symbol.upper()] = candidate.candidate_id
+    resolved: set[str] = set()
+    unknown: list[str] = []
+    for raw in values:
+        value = str(raw or "").strip()
+        candidate_id = lookup.get(value.lower()) or lookup.get(value.upper())
+        if candidate_id:
+            resolved.add(candidate_id)
+        else:
+            unknown.append(value or "<empty>")
+    if unknown:
+        raise ValueError(f"unknown LPG symbol/candidate for scope {scope}: {', '.join(unknown)}")
+    return resolved
+
+
+def _resolve_curve_ids(
+    values: Sequence[str] | None, *, scope: str,
+) -> set[str] | None:
+    if values is None:
+        return None
+    lookup: dict[str, str] = {}
+    for curve in curves_for_scope(scope):
+        lookup[curve.candidate_id.lower()] = curve.candidate_id
+        lookup[curve.curve_code.upper()] = curve.candidate_id
+    resolved: set[str] = set()
+    unknown: list[str] = []
+    for raw in values:
+        value = str(raw or "").strip()
+        curve_id = lookup.get(value.lower()) or lookup.get(value.upper())
+        if curve_id:
+            resolved.add(curve_id)
+        else:
+            unknown.append(value or "<empty>")
+    if unknown:
+        raise ValueError(f"unknown LPG curve id/code for scope {scope}: {', '.join(unknown)}")
+    return resolved
+
+
+def _batches(values: Sequence[str], batch_size: int) -> Iterator[tuple[str, ...]]:
+    for start in range(0, len(values), batch_size):
+        yield tuple(values[start:start + batch_size])
+
+
+def _workbook_batch_id(batch_index: int, candidate_ids: Sequence[str]) -> str:
+    if len(candidate_ids) == 1:
+        return candidate_ids[0]
+    digest = hashlib.sha1("|".join(candidate_ids).encode("utf-8")).hexdigest()[:8]
+    return f"batch{batch_index:03d}_{digest}"
+
+
 def build_backfill_workbooks(
-    *, start_year: int, end_year: int, scope: str = "all", force: bool = False
+    *,
+    start_year: int,
+    end_year: int,
+    scope: str = "all",
+    symbols: Sequence[str] | None = None,
+    batch_size: int = 1,
+    force: bool = False,
 ) -> list[Path]:
-    """Build fixed calendar-year workbooks; Excel refresh remains an explicit step."""
+    """Build deterministic, retryable History-Symbol workbooks.
+
+    A batch defaults to one symbol so an invalid or unentitled UDF cannot stop
+    unrelated history from being saved.  ``symbols`` accepts configured Platts
+    symbols or candidate ids and is intentionally scoped before batching.
+    """
     _validate_scope(scope)
     if start_year > end_year:
         raise ValueError("start_year must be <= end_year")
+    if batch_size < 1 or batch_size > 10:
+        raise ValueError("batch_size must be between 1 and 10")
     scopes = ("asia", "overnight") if scope == "all" else (scope,)
+    requested = _resolve_candidate_ids(symbols, scope=scope)
     paths: list[Path] = []
     for year in range(start_year, end_year + 1):
         for item in scopes:
-            selected = tuple(
+            selected = [
                 candidate.candidate_id for candidate in candidates_for_scope(item)
                 if candidate.enabled and candidate.symbol
-                and candidate.symbol not in LIVE_DAILY_EXCLUDED_SYMBOLS
-            )
+                and (requested is None or candidate.candidate_id in requested)
+            ]
+            for batch_index, batch in enumerate(_batches(selected, batch_size), 1):
+                batch_id = _workbook_batch_id(batch_index, batch)
+                paths.append(build_workbook(
+                    workbook_path(
+                        item, purpose="backfill", year=year, batch_id=batch_id,
+                    ),
+                    scope=item,
+                    purpose="backfill",
+                    year=year,
+                    force=force,
+                    include_discovery=False,
+                    candidate_ids=batch,
+                    query_kinds=("history",),
+                    include_curves=False,
+                    include_ewindow=False,
+                ))
+    return paths
+
+
+def build_curve_workbooks(
+    *,
+    scope: str = "all",
+    curve_ids: Sequence[str] | None = None,
+    batch_size: int = 1,
+    force: bool = False,
+) -> list[Path]:
+    """Build FC CurveData workbooks isolated from daily price refreshes."""
+    _validate_scope(scope)
+    if batch_size < 1 or batch_size > 10:
+        raise ValueError("batch_size must be between 1 and 10")
+    requested = _resolve_curve_ids(curve_ids, scope=scope)
+    scopes = ("asia", "overnight") if scope == "all" else (scope,)
+    paths: list[Path] = []
+    for item in scopes:
+        selected = [
+            curve.candidate_id for curve in curves_for_scope(item)
+            if curve.enabled and curve.curve_code
+            and (requested is None or curve.candidate_id in requested)
+        ]
+        for batch_index, batch in enumerate(_batches(selected, batch_size), 1):
+            batch_id = _workbook_batch_id(batch_index, batch)
             paths.append(build_workbook(
-                workbook_path(item, purpose="backfill", year=year), scope=item,
-                purpose="backfill", year=year, force=force, include_discovery=False,
-                candidate_ids=selected, include_ewindow=False,
+                workbook_path(item, purpose="curve", batch_id=batch_id),
+                scope=item,
+                purpose="curve",
+                force=force,
+                include_discovery=False,
+                candidate_ids=(),
+                curve_candidate_ids=batch,
+                query_kinds=(),
+                include_curves=True,
+                include_ewindow=False,
             ))
     return paths
+
+
+def build_moc_workbooks(*, scope: str = "all", force: bool = False) -> list[Path]:
+    """Build isolated eWindow TradeData workbooks for the MOC view."""
+    _validate_scope(scope)
+    scopes = ("asia", "overnight") if scope == "all" else (scope,)
+    return [
+        build_workbook(
+            workbook_path(item, purpose="moc"),
+            scope=item,
+            purpose="moc",
+            force=force,
+            include_discovery=False,
+            candidate_ids=(),
+            curve_candidate_ids=(),
+            query_kinds=(),
+            include_curves=False,
+            include_ewindow=True,
+        )
+        for item in scopes
+    ]
 
 
 def parse_workbook(path: Path | str) -> dict[str, Any]:
@@ -542,6 +713,15 @@ def parse_workbook(path: Path | str) -> dict[str, Any]:
                 error_code = error_code or "parse_error"
             parsed = [_clean_record(record) for record in parsed]
             parsed = [record for record in parsed if record]
+            if spec.kind == "history" and spec.year is not None:
+                # This Add-in build accepts the proven lower AssessDate bound
+                # but can reject an additional upper bound. Keep each annual
+                # batch deterministic after retrieval instead.
+                year_prefix = f"{spec.year:04d}-"
+                parsed = [
+                    record for record in parsed
+                    if str(record.get("assess_date") or "").startswith(year_prefix)
+                ]
             records.extend(parsed)
             if parsed:
                 status, reason = "entitled", "data_returned"
@@ -563,28 +743,51 @@ def parse_workbook(path: Path | str) -> dict[str, Any]:
         concrete_scope = next(iter(scopes)) if len(scopes) == 1 else "all"
         for item in discovery:
             item["scope"] = concrete_scope
-        for candidate in candidates_for_scope(concrete_scope):
-            if candidate.candidate_id in seen_candidates:
-                continue
-            entitlements.append({
-                "canonical_key": canonical_key(candidate.candidate_id),
-                "candidate_id": candidate.candidate_id,
-                "series_id": candidate.series_id,
-                "symbol": candidate.symbol or None,
-                "curve_code": None,
-                "dataset": "MD",
-                "data_series": None,
-                "scope": candidate.scope,
-                "query_group": candidate.query_group,
-                "status": "pending_review",
-                "record_count": 0,
-                "reason_code": "symbol_not_confirmed" if not candidate.symbol else "not_queried",
-            })
+        # Only the daily/current catalog owns the broad entitlement matrix.
+        # A one-symbol history retry or curve/MOC workbook must not downgrade
+        # unrelated candidates merely because they were intentionally absent.
+        if any(spec.kind in {"current", "correction"} for spec in specs):
+            for candidate in candidates_for_scope(concrete_scope):
+                if candidate.candidate_id in seen_candidates:
+                    continue
+                entitlements.append({
+                    "canonical_key": canonical_key(candidate.candidate_id),
+                    "candidate_id": candidate.candidate_id,
+                    "series_id": candidate.series_id,
+                    "symbol": candidate.symbol or None,
+                    "curve_code": None,
+                    "dataset": "MD",
+                    "data_series": None,
+                    "scope": candidate.scope,
+                    "query_group": candidate.query_group,
+                    "status": "pending_review",
+                    "record_count": 0,
+                    "reason_code": "symbol_not_confirmed" if not candidate.symbol else "not_queried",
+                })
 
+        manifest_years = {spec.year for spec in specs if spec.year is not None}
+        kinds = {spec.kind for spec in specs}
+        detected_purpose = "daily"
+        if kinds == {"history"} and manifest_years:
+            detected_purpose = "backfill"
+        elif kinds == {"curve"}:
+            detected_purpose = "curve"
+        elif kinds == {"ewindow"}:
+            detected_purpose = "moc"
+        purpose = str(runtime_status.get("purpose") or detected_purpose).lower()
+        if purpose not in VALID_PURPOSES:
+            purpose = detected_purpose
+        runtime_year = runtime_status.get("year")
+        parsed_year = (
+            int(runtime_year) if runtime_year not in (None, "") else
+            next(iter(manifest_years)) if len(manifest_years) == 1 else None
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "generated_at": _utc_now(),
             "scope": concrete_scope,
+            "purpose": purpose,
+            "year": parsed_year,
             "workbook": str(source),
             "workbook_mtime": dt.datetime.fromtimestamp(
                 source.stat().st_mtime, tz=dt.timezone.utc
@@ -634,10 +837,30 @@ def write_staging(
     payload: Mapping[str, Any],
     *,
     staging_dir: Path | str = STAGING_DIR,
-    purpose: str = "daily",
+    purpose: str | None = None,
     year: int | None = None,
+    batch_id: str | None = None,
 ) -> Path | None:
-    """Atomically stage valid data; empty/failure payloads leave latest.json intact."""
+    """Atomically stage data, inferring specialized workbook destinations."""
+    runtime_status = payload.get("runtime_status")
+    runtime = runtime_status if isinstance(runtime_status, Mapping) else {}
+    inferred_purpose = str(
+        payload.get("purpose") or runtime.get("purpose") or "daily"
+    ).lower()
+    purpose = str(purpose or inferred_purpose).lower()
+    if purpose == "history":
+        purpose = "backfill"
+    if purpose not in VALID_PURPOSES:
+        raise ValueError(f"purpose must be one of {sorted(VALID_PURPOSES)}")
+    if year is None:
+        raw_year = payload.get("year") or runtime.get("year")
+        year = int(raw_year) if raw_year not in (None, "") else None
+    if purpose == "backfill" and year is None:
+        raise ValueError("backfill staging requires year")
+    if batch_id is None and purpose != "daily":
+        workbook = payload.get("workbook")
+        if isinstance(workbook, (str, Path)) and str(workbook):
+            batch_id = Path(workbook).stem
     destination = Path(staging_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     records = list(payload.get("records") or [])
@@ -645,6 +868,8 @@ def write_staging(
         "schema_version": SCHEMA_VERSION,
         "updated_at": _utc_now(),
         "scope": payload.get("scope", "all"),
+        "purpose": purpose,
+        "year": year,
         "state": payload.get("status", "unknown"),
         "record_count": len(records),
         "error_count": len(payload.get("errors") or []),
@@ -653,7 +878,8 @@ def write_staging(
             if item.get("reason_code")
         }),
     }
-    _atomic_json(destination / "status.json", status_payload)
+    status_dir = destination if purpose == "daily" else destination / purpose
+    _atomic_json(status_dir / "status.json", status_payload)
     entitlements = list(payload.get("entitlement_results") or [])
     discovery = list(payload.get("discovery") or [])
     if not records and not entitlements and not discovery:
@@ -663,6 +889,8 @@ def write_staging(
         "schema_version": SCHEMA_VERSION,
         "generated_at": payload.get("generated_at") or _utc_now(),
         "scope": payload.get("scope", "all"),
+        "purpose": purpose,
+        "year": year,
         "workbook": payload.get("workbook"),
         "workbook_mtime": payload.get("workbook_mtime"),
         "status": payload.get("status", "success"),
@@ -675,15 +903,26 @@ def write_staging(
 
     runs_dir = destination / "runs"
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_path = runs_dir / f"{stamp}_{_safe_slug(str(clean_payload['scope']))}.json"
+    batch_suffix = f"_{_safe_slug(batch_id)}" if batch_id else ""
+    run_path = runs_dir / (
+        f"{stamp}_{_safe_slug(purpose)}_{_safe_slug(str(clean_payload['scope']))}"
+        f"{batch_suffix}.json"
+    )
     _atomic_json(run_path, clean_payload)
 
     if purpose == "backfill":
-        if year is None:
-            raise ValueError("backfill staging requires year")
-        backfill_path = destination / "backfill" / f"{year}_{_safe_slug(str(clean_payload['scope']))}.json"
+        backfill_path = destination / "backfill" / (
+            f"{year}_{_safe_slug(str(clean_payload['scope']))}{batch_suffix}.json"
+        )
         _atomic_json(backfill_path, clean_payload)
         return backfill_path
+
+    if purpose in {"curve", "moc"}:
+        specialized_path = destination / purpose / (
+            f"latest_{_safe_slug(str(clean_payload['scope']))}{batch_suffix}.json"
+        )
+        _atomic_json(specialized_path, clean_payload)
+        return specialized_path
 
     latest_path = destination / "latest.json"
     merged = _merge_latest(latest_path, clean_payload)
@@ -692,9 +931,16 @@ def write_staging(
 
 
 def write_runtime_status(
-    *, scope: str, state: str, reason_code: str, staging_dir: Path | str = STAGING_DIR
+    *,
+    scope: str,
+    state: str,
+    reason_code: str,
+    staging_dir: Path | str = STAGING_DIR,
+    purpose: str = "daily",
 ) -> Path:
     _validate_scope(scope)
+    if purpose not in VALID_PURPOSES:
+        raise ValueError(f"purpose must be one of {sorted(VALID_PURPOSES)}")
     payload = {
         "schema_version": SCHEMA_VERSION,
         "updated_at": _utc_now(),
@@ -704,7 +950,8 @@ def write_runtime_status(
         "error_count": 1,
         "reason_codes": [reason_code],
     }
-    target = Path(staging_dir).resolve() / "status.json"
+    destination = Path(staging_dir).resolve()
+    target = (destination if purpose == "daily" else destination / purpose) / "status.json"
     _atomic_json(target, payload)
     return target
 
@@ -904,9 +1151,10 @@ def _parse_curve_data(rows: Sequence[Sequence[Any]], spec: QuerySpec) -> list[di
             assess = _iso_date(_row_value(row, columns, "date", "assessdate", "valuedate"))
             if value is None or not assess:
                 continue
+            contract_code = _text(_row_value(row, columns, "contractcode"))
             records.append(_base_record(spec, {
                 "record_type": "curve_point",
-                "symbol": _text(_row_value(row, columns, "symbol", "contractcode")) or None,
+                "symbol": _text(_row_value(row, columns, "symbol")) or contract_code or None,
                 "curve_code": _text(_row_value(row, columns, "curvecode")) or spec.curve_code,
                 "description": _text(_row_value(row, columns, "description")) or spec.label,
                 "value": value,
@@ -915,7 +1163,9 @@ def _parse_curve_data(rows: Sequence[Sequence[Any]], spec: QuerySpec) -> list[di
                 "bate": _text(_row_value(row, columns, "bate")).lower() or "c",
                 "assess_date": assess,
                 "mod_date": _iso_datetime(_row_value(row, columns, "moddate", "modifieddate")),
-                "contract_label": _text(_row_value(row, columns, "contract", "tenor", "period", "strip")) or None,
+                "contract_label": _text(_row_value(
+                    row, columns, "contract", "contractcode", "tenor", "period", "strip",
+                )) or None,
                 "contract_date": _iso_date(_row_value(row, columns, "contractdate", "deliverydate")),
             }))
         if records:
@@ -1068,13 +1318,14 @@ def _current_formula(symbol: str) -> str:
 def _history_formula(symbol: str, *, year: int | None = None) -> str:
     if year is not None:
         filter_text = (
-            f"Symbol='{symbol}' and ModDate>={year}-01-01 and "
-            f"ModDate<={year}-12-31"
+            f"Symbol in ('{symbol}') and AssessDate>={year}-01-01 and "
+            "Bate in ('c','u')"
         )
         return f'=PlattsGetData("MD","History-Symbol",,"{filter_text}")'
     return (
-        '=PlattsGetData("MD","History-Symbol",,"Symbol=\'' + symbol
-        + "' and ModDate>=" + '"&TEXT(PlattsToday()-45,"yyyy-mm-dd")&"'
+        '=PlattsGetData("MD","History-Symbol",,"Symbol in (\'' + symbol
+        + "') and AssessDate>=" + '"&TEXT(PlattsToday()-45,"yyyy-mm-dd")&"'
+        + " and Bate in ('c','u')"
         + '")'
     )
 
@@ -1106,7 +1357,10 @@ def _ewindow_filters(scope: str, *, purpose: str, year: int | None) -> tuple[tup
     product_filter = "(Market='*LPG*' or Product='*Propane*' or Product='*Butane*')"
     if scope == "asia":
         return (("asia_lpg", f"Window_Region='asia' and {date_filter} and {product_filter}"),)
-    return (("americas_ngl", f"{date_filter} and {product_filter}"),)
+    return ((
+        "americas_ngl",
+        f"Window_Region='americas' and {date_filter} and {product_filter}",
+    ),)
 
 
 def _ewindow_formula(filter_text: str) -> str:
@@ -1353,7 +1607,8 @@ def _validate_scope(scope: str) -> None:
 
 __all__ = [
     "CANDIDATES", "CURVE_CANDIDATES", "PRIVATE_DIR", "SCHEMA_VERSION", "STAGING_DIR",
-    "build_backfill_workbooks", "build_scope_workbooks", "build_workbook",
-    "candidates_for_scope", "combine_payloads", "curves_for_scope", "parse_workbook",
-    "workbook_path", "write_runtime_status", "write_staging",
+    "build_backfill_workbooks", "build_curve_workbooks", "build_moc_workbooks",
+    "build_scope_workbooks", "build_workbook", "candidates_for_scope", "combine_payloads",
+    "curves_for_scope", "parse_workbook", "workbook_path", "write_runtime_status",
+    "write_staging",
 ]

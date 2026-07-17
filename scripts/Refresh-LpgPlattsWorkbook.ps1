@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Workbook,
     [int]$TimeoutSec = 240,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$DeElevatedRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +15,81 @@ if (-not (Test-Path -LiteralPath $Workbook)) {
 if ($DryRun) {
     Write-Output "DRY_RUN workbook=$Workbook timeout=$TimeoutSec"
     exit 0
+}
+
+# The S&P COM Add-in and its remembered WebView2 login are registered in the
+# interactive user's medium-integrity profile.  An elevated Terminal/server
+# would otherwise launch elevated Excel, where the per-user ribbon/session can
+# disappear.  Re-dispatch only this refresh through a unique, temporary,
+# interactive Limited task and relay its output/exit code to the caller.
+$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+if ($isElevated -and $DeElevatedRun) {
+    Write-Output 'DEELEVATION_FAILED child task is still elevated'
+    exit 3
+}
+if ($isElevated) {
+    $runToken = [Guid]::NewGuid().ToString('N')
+    $taskName = "Fincept LPG DeElevated $runToken"
+    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    $cmdPath = Join-Path $tempRoot ("fincept-lpg-deelevated-$runToken.cmd")
+    $logPath = Join-Path $tempRoot ("fincept-lpg-deelevated-$runToken.log")
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $taskRegistered = $false
+    try {
+        Write-Output 'ELEVATED_SHELL_DETECTED redispatching as the interactive user at Limited integrity'
+        @(
+            '@echo off',
+            'setlocal',
+            ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath +
+                '" -Workbook "' + $Workbook + '" -TimeoutSec ' + $TimeoutSec +
+                ' -DeElevatedRun > "' + $logPath + '" 2>&1'),
+            'set "FINCEPT_LPG_EXIT=%ERRORLEVEL%"',
+            ('echo EXIT=%FINCEPT_LPG_EXIT%>>"' + $logPath + '"'),
+            'exit /b %FINCEPT_LPG_EXIT%'
+        ) | Set-Content -LiteralPath $cmdPath -Encoding ASCII
+
+        $action = New-ScheduledTaskAction -Execute $env:ComSpec -Argument "/d /c `"`"$cmdPath`"`""
+        $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (
+            New-TimeSpan -Seconds ([Math]::Max(180, $TimeoutSec + 90))
+        ) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Description `
+            'Temporary Limited-integrity S&P Excel refresh launched from an elevated Fincept process.' `
+            -Force | Out-Null
+        $taskRegistered = $true
+        Start-ScheduledTask -TaskName $taskName
+
+        $deadline = (Get-Date).AddSeconds([Math]::Max(180, $TimeoutSec + 75))
+        $exitMatch = $null
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            if (Test-Path -LiteralPath $logPath) {
+                $exitMatch = Select-String -LiteralPath $logPath -Pattern '^EXIT=(-?\d+)$' |
+                    Select-Object -Last 1
+                if ($exitMatch) { break }
+            }
+        }
+        if (-not $exitMatch) {
+            Write-Output 'DEELEVATED_RUN_TIMEOUT no exit marker was returned'
+            exit 3
+        }
+        Get-Content -LiteralPath $logPath | Where-Object { $_ -notmatch '^EXIT=-?\d+$' } |
+            ForEach-Object { Write-Output $_ }
+        exit [int]$exitMatch.Matches[0].Groups[1].Value
+    } catch {
+        Write-Output ("DEELEVATED_RUN_FAILED " + $_.Exception.Message)
+        exit 3
+    } finally {
+        if ($taskRegistered) {
+            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $cmdPath, $logPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Never attach to or take focus from a workbook the user already has open.
@@ -161,11 +237,20 @@ function Get-ResolutionCounts {
 try {
     # A normal Excel process is required; creating Excel.Application directly
     # does not load the official Add-in. The generated workbook itself requests
-    # manual calculation, so it can safely be opened before COM attaches.
+    # manual calculation, so it can safely be opened before COM attaches.  Keep
+    # Excel visible during startup: the Add-in restores its remembered login in
+    # a normal desktop window before automation attaches.  Hiding Excel at
+    # process creation makes the Add-in take its COM-automation startup path and
+    # leaves the ribbon signed out even when its UDF token is still valid.
     $stage = 'launching_excel'
-    $process = Start-Process -FilePath 'excel.exe' -ArgumentList "`"$Workbook`"" -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 15
+    $process = Start-Process -FilePath 'excel.exe' -ArgumentList "`"$Workbook`"" -PassThru
+    Start-Sleep -Seconds 20
+    $windowActivator = New-Object -ComObject WScript.Shell
     for ($attempt = 0; $attempt -lt 20 -and $null -eq $excel; $attempt++) {
+        foreach ($windowTitle in @([System.IO.Path]::GetFileNameWithoutExtension($Workbook), 'Excel')) {
+            try { [void]$windowActivator.AppActivate($windowTitle) } catch {}
+        }
+        Start-Sleep -Milliseconds 750
         try { $excel = [Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application') }
         catch { Start-Sleep -Seconds 2 }
     }
@@ -251,6 +336,10 @@ try {
             $allQueriesCompleted = ($counts[4] -gt 0 -and $counts[3] -ge $counts[4])
             if ($hasResolved -and ($allQueriesCompleted -or $stablePasses -ge 3)) { break }
             if ($hasResolved -and $excel.CalculationState -eq 0) { break }
+            # A stable terminal formula error is also a completed query.  Do
+            # not hold the automation-owned Excel instance until the full timeout when
+            # every isolated sheet has already returned the same error.
+            if ($allQueriesCompleted -and $stablePasses -ge 3) { break }
         }
     }
 

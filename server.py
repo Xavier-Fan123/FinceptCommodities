@@ -31,6 +31,7 @@ import threading
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -61,6 +62,7 @@ SEASON_TTL, SEASON_SWR = 86400, 86400    # 10y monthly stats change ~monthly
 COT_TTL, COT_SWR = 21600, 86400          # COT is published weekly (Fri)
 INV_TTL, INV_SWR = 21600, 86400          # EIA inventories are weekly (Wed/Thu)
 NEWS_TTL, NEWS_SWR = 900, 1800           # public RSS/news search
+LPG_NEWS_REFRESH_SECONDS = 120            # trader flow: keep the persisted feed near-real-time
 
 _CACHE = {}          # key -> (fetched_at, value)
 _CACHE_LOCK = threading.Lock()
@@ -69,6 +71,8 @@ _REFRESHING = set()  # keys with an in-flight background refresh
 
 _LPG_RUNTIME = None
 _LPG_RUNTIME_LOCK = threading.Lock()
+_LPG_NEWS_AUTO_LOCK = threading.Lock()
+_LPG_NEWS_AUTO_LAST = 0.0
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -517,6 +521,84 @@ def _entitlement_filter(query, name="entitlement"):
     return value
 
 
+def _timestamp_epoch(value):
+    """Return a UTC epoch for an ISO timestamp, or zero for malformed input."""
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _news_snapshot_times(payload):
+    rows = payload.get("items") or payload.get("articles") or []
+    latest_fetch = max((_timestamp_epoch(row.get("fetched_at")) for row in rows), default=0.0)
+    latest_publish = max((
+        _timestamp_epoch(row.get("published_at") or row.get("published")) for row in rows
+    ), default=0.0)
+    return latest_fetch, latest_publish
+
+
+def _queue_lpg_news_refresh(jobs, force=False):
+    """Start one background news refresh while throttling repeated browser polls."""
+    global _LPG_NEWS_AUTO_LAST
+    active = jobs.active()
+    if active:
+        return active
+    now = time.time()
+    with _LPG_NEWS_AUTO_LOCK:
+        if not force and now - _LPG_NEWS_AUTO_LAST < LPG_NEWS_REFRESH_SECONDS:
+            return None
+        _LPG_NEWS_AUTO_LAST = now
+    try:
+        return jobs.start("news")
+    except RefreshBusy as exc:
+        return exc.job
+
+
+def _lpg_refresh_parameters(payload, scope):
+    """Validate the small, local-only parameter surface for targeted refreshes."""
+    allowed_keys = {"scope"}
+    parameters = {}
+    if scope in {"history", "curves", "moc"}:
+        allowed_keys.add("market_scope")
+        market_scope = payload.get("market_scope", "all")
+        if not isinstance(market_scope, str) or market_scope.strip().lower() not in {
+            "asia", "overnight", "all",
+        }:
+            raise ValueError("market_scope must be asia, overnight, or all")
+        parameters["market_scope"] = market_scope.strip().lower()
+
+    list_key = "symbols" if scope == "history" else "curve_ids" if scope == "curves" else None
+    if list_key:
+        allowed_keys.add(list_key)
+        values = payload.get(list_key)
+        if values is not None:
+            if not isinstance(values, list) or not 1 <= len(values) <= 20:
+                raise ValueError(f"{list_key} must be a non-empty list of at most 20 values")
+            cleaned = []
+            for value in values:
+                token = str(value).strip().upper() if isinstance(value, str) else ""
+                if not token or len(token) > 32 or any(
+                    character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in token
+                ):
+                    raise ValueError(f"{list_key} contains an invalid value")
+                if token not in cleaned:
+                    cleaned.append(token)
+            parameters[list_key] = cleaned
+
+    unknown = set(payload) - allowed_keys
+    if unknown:
+        raise ValueError(f"unsupported refresh parameter(s): {', '.join(sorted(unknown))}")
+    return parameters
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # quiet
         pass
@@ -623,18 +705,55 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/lpg/news":
                 filters = _query_fields(query, (
                     "topic", "product", "region", "source", "direction",
-                    "importance", "start", "q",
+                    "importance", "start", "q", "cluster_id", "breaking",
+                    "min_relevance",
                 ))
                 end = _query_value(query, "end") or _query_value(query, "as_of")
                 if end:
                     filters["end"] = end
-                limit = _query_int(query, "limit", minimum=1, maximum=5000)
+                if "breaking" in filters and str(filters["breaking"]).lower() not in {
+                    "0", "1", "true", "false", "yes", "no",
+                }:
+                    raise ValueError("query parameter 'breaking' must be a boolean")
+                limit = _query_int(query, "limit", default=300, minimum=1, maximum=5000)
                 offset = _query_int(query, "offset", minimum=0, maximum=10_000_000)
-                if limit is not None:
-                    filters["limit"] = limit
+                filters["limit"] = limit
                 if offset is not None:
                     filters["offset"] = offset
-                return self._json(service.news(filters))
+                payload = service.news(filters)
+                latest_fetch, latest_publish = _news_snapshot_times(payload)
+                now = time.time()
+                stale = not latest_fetch or now - latest_fetch >= LPG_NEWS_REFRESH_SECONDS
+                auto_value = str(_query_value(query, "auto_refresh", "1")).lower()
+                auto_enabled = auto_value not in {"0", "false", "no", "off"}
+                historical = bool(end)
+                force = _is_fresh(query)
+                # Always surface an already-running job so the News UI keeps
+                # its 10-second completion polling even after the snapshot is
+                # no longer considered stale.
+                refresh_job = jobs.active()
+                if not historical and (force or (auto_enabled and stale)):
+                    refresh_job = _queue_lpg_news_refresh(jobs, force=force)
+                payload.setdefault(
+                    "updated_at",
+                    datetime.fromtimestamp(latest_fetch or now, timezone.utc).isoformat(),
+                )
+                payload["refresh"] = {
+                    "policy": "stale_while_refresh",
+                    "interval_seconds": LPG_NEWS_REFRESH_SECONDS,
+                    "auto_enabled": auto_enabled and not historical,
+                    "stale": stale,
+                    "latest_fetch_at": (
+                        datetime.fromtimestamp(latest_fetch, timezone.utc).isoformat()
+                        if latest_fetch else None
+                    ),
+                    "latest_article_at": (
+                        datetime.fromtimestamp(latest_publish, timezone.utc).isoformat()
+                        if latest_publish else None
+                    ),
+                    "job": refresh_job,
+                }
+                return self._json(payload)
 
             if path == "/api/lpg/explorer":
                 dataset = _query_value(query, "dataset", "observations")
@@ -796,8 +915,10 @@ class Handler(BaseHTTPRequestHandler):
             scope = payload.get("scope", "all")
             if not isinstance(scope, str):
                 raise ValueError("refresh scope must be a string")
+            scope = scope.strip().lower() or "all"
+            parameters = _lpg_refresh_parameters(payload, scope)
             _service, _workflow, jobs = _lpg_runtime()
-            job = jobs.start(scope.strip().lower() or "all")
+            job = jobs.start(scope, parameters=parameters)
             return self._json({"job": job}, 202)
         except Exception as exc:  # noqa: BLE001 - local API boundary
             return self._lpg_error(exc)
@@ -810,6 +931,22 @@ def _warm_up():
         overview_payload()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        _service, _workflow, jobs = _lpg_runtime()
+        _queue_lpg_news_refresh(jobs, force=True)
+    except Exception:  # noqa: BLE001 - dashboard startup must remain available
+        pass
+
+
+def _lpg_news_refresh_loop():
+    """Keep the local trader news snapshot warm while the dashboard is running."""
+    while True:
+        threading.Event().wait(LPG_NEWS_REFRESH_SECONDS)
+        try:
+            _service, _workflow, jobs = _lpg_runtime()
+            _queue_lpg_news_refresh(jobs)
+        except Exception:  # noqa: BLE001 - the next interval retries a failed feed
+            pass
 
 
 def main():
@@ -825,6 +962,9 @@ def main():
     print(f"Fincept Commodities — local dashboard running at {url}")
     print("Press Ctrl+C to stop.")
     threading.Thread(target=_warm_up, daemon=True).start()
+    threading.Thread(
+        target=_lpg_news_refresh_loop, daemon=True, name="lpg-news-refresh-loop",
+    ).start()
     if "--no-browser" not in sys.argv:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try:

@@ -1,4 +1,7 @@
+import json
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import patch
 
 from _support import WorkspaceScratchMixin
 from lpg.service import LpgService
@@ -12,6 +15,13 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
         super().setUp()
         self.service = LpgService(db_path=self.scratch / "lpg.sqlite")
         self.store = self.service.store
+        # Service health intentionally reads the live specialized staging
+        # status. Keep unit tests isolated from a developer's real refresh run.
+        self.staging_patch = patch(
+            "lpg.platts_excel.STAGING_DIR", self.scratch / "staging",
+        )
+        self.staging_patch.start()
+        self.addCleanup(self.staging_patch.stop)
 
     def add_series(self, series_id, canonical_key, entitlement="entitled", **extra):
         return self.store.upsert_series({
@@ -168,6 +178,370 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             {"FEI_PROPANE": "2026-07-15", "CP_PROPANE": "2026-07-01"},
             {row["canonical_key"]: row["observation_date"] for row in spread["legs"]},
         )
+
+    def test_multi_date_history_and_dataset_health_are_explicit(self):
+        self.add_series("fei", "FEI_PROPANE")
+        self.add_observation("fei", "2026-07-09", 518)
+        self.add_observation("fei", "2026-07-10", 520)
+        self.store.upsert_dataset_row({
+            "dataset": "platts_ewindow", "row_key": "moc-1",
+            "as_of_date": "2026-07-10", "source": "fixture",
+            "payload": {"series_id": "fei", "price": 520},
+        })
+        self.store.upsert_dataset_row({
+            "dataset": "platts_fundamentals", "row_key": "fund-1",
+            "as_of_date": "2026-07-10", "source": "fixture",
+            "payload": {"symbol": "fixture_inventory", "value": 12},
+        })
+
+        history = self.service.series_history("fei")
+        self.assertEqual(["2026-07-09", "2026-07-10"],
+                         [row["date"] for row in history["observations"]])
+        self.assertEqual({"status": "ready", "reason": None, "rows": 2, "dates": 2},
+                         history["availability"])
+
+        datasets = self.service.status()["datasets"]
+        self.assertEqual((1, 1, 1, "ready"), (
+            datasets["current"]["rows"], datasets["current"]["dates"],
+            datasets["current"]["series"], datasets["current"]["status"],
+        ))
+        self.assertEqual((2, 2, 1, 1, "ready"), (
+            datasets["history"]["rows"], datasets["history"]["dates"],
+            datasets["history"]["series"], datasets["history"]["multi_date_series"],
+            datasets["history"]["status"],
+        ))
+        self.assertEqual((1, 1, 1, "ready"), (
+            datasets["moc"]["rows"], datasets["moc"]["dates"],
+            datasets["moc"]["series"], datasets["moc"]["status"],
+        ))
+        self.assertEqual("ready", datasets["fundamentals"]["status"])
+
+    def test_official_and_derived_prompt_curves_have_distinct_provenance(self):
+        component_ids = []
+        for tenor, canonical, value in (
+            ("hm1", "FEI_PROPANE_HM1", 520),
+            ("hm2", "FEI_PROPANE_HM2", 524),
+            ("hm3", "FEI_PROPANE_HM3", 529),
+        ):
+            self.add_series(tenor, canonical)
+            self.add_observation(tenor, "2026-07-10", value)
+            component_ids.append(tenor)
+
+        derived_only = self.service.curves()
+        self.assertEqual(("derived_only", 0, 1), (
+            derived_only["status"], derived_only["official_curve_count"],
+            derived_only["derived_curve_count"],
+        ))
+        derived = derived_only["curves"][0]
+        self.assertTrue(derived["derived"])
+        self.assertFalse(derived["is_official"])
+        self.assertEqual("derived_prompt_structure", derived["curve_kind"])
+        self.assertEqual("hm1", derived["series_id"])
+        self.assertEqual(component_ids, derived["component_series_ids"])
+        self.assertEqual(["HM1", "HM2", "HM3"],
+                         [point["tenor"] for point in derived["points"]])
+        self.assertTrue(all(point["source_series_id"] in component_ids
+                            for point in derived["points"]))
+        self.assertIn("not an official Platts FC curve", derived["methodology"])
+
+        self.add_series("official", "CURVE_FEI_PROPANE", quote_kind="curve")
+        self.store.upsert_curve_point({
+            "series_id": "official", "as_of_date": "2026-07-10",
+            "contract_month": "2026-08", "value_native": 525,
+            "currency_native": "USD", "unit_native": "mt",
+            "fetched_at": FIXED_FETCHED_AT,
+        })
+        combined = self.service.curves()
+        self.assertEqual(("ready", 1, 1), (
+            combined["status"], combined["official_curve_count"],
+            combined["derived_curve_count"],
+        ))
+        official = next(curve for curve in combined["curves"] if curve["is_official"])
+        self.assertEqual("official_fc_curve", official["curve_kind"])
+        self.assertFalse(official["derived"])
+        self.assertEqual((4, 2), (
+            combined["dataset_status"]["rows"], combined["dataset_status"]["series"],
+        ))
+
+    def test_empty_curve_response_explains_missing_inputs(self):
+        payload = self.service.curves()
+        self.assertEqual([], payload["curves"])
+        self.assertEqual("empty", payload["status"])
+        self.assertEqual(
+            "no_official_curve_points_or_complete_hm1_hm2_hm3_assessments",
+            payload["reason"],
+        )
+        self.assertEqual(payload["reason"], payload["dataset_status"]["reason"])
+
+    def test_specialized_import_keeps_curve_identity_and_does_not_mutate_price_series(self):
+        self.add_series(
+            "price", "FEI_PROPANE", source="platts_excel", symbol="PMAAV00",
+            name="CFR North Asia Propane",
+        )
+        payload = {
+            "schema_version": 1,
+            "generated_at": FIXED_FETCHED_AT,
+            "scope": "asia",
+            "status": "success",
+            "records": [
+                {
+                    "record_type": "curve_point", "series_id": "curve_fei",
+                    "canonical_key": "CURVE_FEI_PROPANE", "candidate_id": "curve_cfr_na_propane",
+                    "dataset": "FC", "data_series": "CurveData", "curve_code": "CN3HO",
+                    # ContractCode is emitted as symbol by the FC parser.
+                    "symbol": "AUG26", "description": "FEI official curve",
+                    "value": 525, "currency": "USD", "uom": "MT",
+                    "assess_date": "2026-07-10", "scope": "asia",
+                },
+                {
+                    "record_type": "curve_point", "series_id": "curve_cp",
+                    "canonical_key": "CURVE_CP_PROPANE", "candidate_id": "curve_saudi_cp_propane",
+                    "dataset": "FC", "data_series": "CurveData", "curve_code": "CN0PT",
+                    # The same contract code must not merge two different curves.
+                    "symbol": "AUG26", "description": "Saudi CP official curve",
+                    "value": 500, "currency": "USD", "uom": "MT",
+                    "assess_date": "2026-07-10", "scope": "asia",
+                },
+                {
+                    "record_type": "ewindow_trade", "series_id": "platts_ewindow_asia",
+                    "canonical_key": "EWINDOW_LPG_TRADES", "candidate_id": "ewindow_asia_asia_lpg",
+                    "dataset": "eWMD", "data_series": "TradeData",
+                    # This intentionally collides with an existing price symbol.
+                    "symbol": "PMAAV00", "description": "Asia LPG trade",
+                    "value": 521, "currency": "USD", "uom": "MT",
+                    "assess_date": "2026-07-10", "scope": "asia", "order_id": "trade-1",
+                },
+            ],
+            "entitlement_results": [],
+            "errors": [],
+        }
+
+        imported = self.service.import_platts_staging(payload)
+
+        self.assertEqual((3, 3, 0), (
+            imported["counts"]["rows_seen"], imported["counts"]["rows_inserted"],
+            imported["counts"]["rows_skipped"],
+        ))
+        curves = self.store.curves()
+        self.assertEqual({"curve_fei", "curve_cp"}, {row["series_id"] for row in curves})
+        self.assertEqual({"AUG26"}, {row["contract_month"] for row in curves})
+        self.assertEqual("CN3HO", self.store.get_series("curve_fei")["symbol"])
+        self.assertEqual("CN0PT", self.store.get_series("curve_cp")["symbol"])
+        price = self.store.get_series("price")
+        self.assertEqual(("FEI_PROPANE", "CFR North Asia Propane"),
+                         (price["canonical_key"], price["name"]))
+        self.assertIsNone(self.store.get_series("platts_ewindow_asia"))
+        self.assertEqual(1, self.store.explorer(
+            "dataset_rows", name="platts_ewindow",
+        )["total"])
+
+    def test_history_entitlement_does_not_downgrade_proven_current_candidate(self):
+        self.add_series(
+            "price", "FEI_PROPANE", source="platts_excel", symbol="PMAAV00",
+        )
+        self.store.update_candidate_entitlement(
+            "FEI_PROPANE", "entitled", mapped_series_id="price",
+            error="data_returned", symbol="PMAAV00",
+        )
+        result = self.service.import_platts_staging({
+            "schema_version": 1,
+            "generated_at": FIXED_FETCHED_AT,
+            "scope": "asia",
+            "status": "discovery_only",
+            "records": [],
+            "entitlement_results": [{
+                "candidate_id": "cfr_na_propane",
+                "canonical_key": "FEI_PROPANE",
+                "series_id": "price",
+                "symbol": "PMAAV00",
+                "dataset": "MD",
+                "data_series": "History-Symbol",
+                "status": "unentitled",
+                "reason_code": "not_entitled_or_invalid_symbol",
+            }],
+            "errors": [],
+        })
+
+        self.assertEqual("success", result["status"])
+        candidate = next(
+            row for row in self.store.candidates() if row["canonical_key"] == "FEI_PROPANE"
+        )
+        self.assertEqual(("entitled", "price", "PMAAV00"), (
+            candidate["discovery_status"], candidate["mapped_series_id"],
+            candidate["mapped_symbol"],
+        ))
+
+    def test_ewindow_import_uses_stable_order_identity_for_updates(self):
+        def payload(records, generated_at):
+            return {
+                "schema_version": 1,
+                "generated_at": generated_at,
+                "scope": "asia",
+                "status": "success",
+                "records": records,
+                "entitlement_results": [],
+                "errors": [],
+            }
+
+        base = {
+            "record_type": "ewindow_trade",
+            "dataset": "eWMD",
+            "data_series": "TradeData",
+            "series_id": "platts_ewindow_asia",
+            "candidate_id": "ewindow_asia_asia_lpg",
+            "canonical_key": "EWINDOW_LPG_TRADES",
+            "assess_date": "2026-07-10",
+            "scope": "asia",
+            "market": "FEI",
+            "product": "Propane",
+            "strip": "Aug 2026",
+            "currency": "USD",
+            "uom": "MT",
+        }
+        first = self.service.import_platts_staging(payload([
+            {
+                **base, "order_id": "order-123", "order_time": "2026-07-10T08:00:00Z",
+                "value": 520, "volume": 5_000, "status": "active",
+                "mod_date": "2026-07-10T08:01:00Z",
+            },
+            {
+                **base, "order_id": None, "order_time": "2026-07-10T08:02:00Z",
+                "value": 521, "volume": 3_000, "status": "active",
+                "mod_date": "2026-07-10T08:03:00Z",
+            },
+        ], FIXED_FETCHED_AT))
+        second = self.service.import_platts_staging(payload([
+            {
+                **base, "order_id": "order-123", "order_time": "2026-07-10T08:00:00Z",
+                "value": 522, "volume": 4_000, "status": "done",
+                "mod_date": "2026-07-10T08:05:00Z",
+            },
+            {
+                **base, "order_id": None, "order_time": "2026-07-10T08:02:00Z",
+                "value": 523, "volume": 2_000, "status": "done",
+                "mod_date": "2026-07-10T08:06:00Z",
+            },
+        ], "2026-07-10T02:00:00+00:00"))
+
+        self.assertEqual((2, 0), (
+            first["counts"]["rows_inserted"], first["counts"]["rows_updated"],
+        ))
+        self.assertEqual((0, 2), (
+            second["counts"]["rows_inserted"], second["counts"]["rows_updated"],
+        ))
+        rows = self.store.explorer(
+            "dataset_rows", name="platts_ewindow", limit=10,
+        )["rows"]
+        self.assertEqual(2, len(rows))
+        self.assertIn("order-123", {row["row_key"] for row in rows})
+        payloads = [json.loads(row["payload_json"]) for row in rows]
+        self.assertEqual({"done"}, {row["status"] for row in payloads})
+        self.assertEqual({522, 523}, {row["value"] for row in payloads})
+
+    def test_specialized_runtime_failures_are_exposed_by_read_responses(self):
+        self.add_series("fei", "FEI_PROPANE")
+        self.add_observation("fei", "2026-07-10", 520)
+        staging = self.scratch / "staging"
+        for directory, reason in (
+            ("backfill", "history_formula_failed"),
+            ("curve", "curve_formula_failed"),
+            ("moc", "moc_formula_failed"),
+        ):
+            target = staging / directory
+            target.mkdir(parents=True)
+            (target / "status.json").write_text(json.dumps({
+                "schema_version": 1,
+                "updated_at": FIXED_FETCHED_AT,
+                "scope": "asia",
+                "state": "failed",
+                "record_count": 0,
+                "error_count": 1,
+                "reason_codes": [reason],
+            }), encoding="utf-8")
+
+        with patch("lpg.platts_excel.STAGING_DIR", staging):
+            history = self.service.series_history("fei")
+            curves = self.service.curves()
+            moc = self.service.explorer(dataset="moc")
+            status = self.service.status()
+
+        self.assertEqual(("failed", "refresh_failed", "history_formula_failed"), (
+            history["refresh_state"], history["availability"]["status"],
+            history["availability"]["reason"],
+        ))
+        self.assertEqual(("failed", "refresh_failed", "curve_formula_failed"), (
+            curves["refresh_state"], curves["dataset_status"]["status"],
+            curves["dataset_status"]["reason"],
+        ))
+        self.assertEqual(("failed", "refresh_failed", "moc_formula_failed"), (
+            moc["refresh_state"], moc["dataset_status"]["status"],
+            moc["dataset_status"]["reason"],
+        ))
+        self.assertEqual("refresh_failed", status["datasets"]["history"]["status"])
+        self.assertEqual("refresh_failed", status["datasets"]["curves"]["status"])
+        self.assertEqual("refresh_failed", status["datasets"]["moc"]["status"])
+        self.assertEqual({"history", "curves", "moc"}, set(status["specialized_runtime"]))
+
+    def test_news_schema_ranking_cluster_alias_and_source_health(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        self.store.upsert_news({
+            "article_key": "ranked-news", "headline": "Asia LPG cargo disruption",
+            "source": "fixture", "published_at": now,
+            "relevance_score": 82, "rank_score": 88, "source_tier": 3,
+            "cluster_key": "evt_fixture", "is_breaking": True,
+            "importance": "high", "entitlement_state": "entitled",
+        })
+        self.service.upsert_news_source_health({
+            "source_id": "fixture_feed", "source_name": "Fixture Feed",
+            "kind": "rss", "status": "healthy", "last_attempt_at": now,
+            "last_success_at": now, "latest_published_at": now,
+            "article_count": 2, "relevant_count": 1, "latency_ms": 12,
+            "metadata": {"production_sla": False},
+        })
+
+        payload = self.service.news({"cluster_id": "evt_fixture"})
+        self.assertEqual(["ranked-news"], [row["article_key"] for row in payload["items"]])
+        item = payload["items"][0]
+        self.assertEqual("breaking", item["freshness"])
+        self.assertTrue(item["is_breaking"])
+        self.assertGreater(item["rank_score"], 0)
+        self.assertEqual("healthy", payload["source_health"][0]["status"])
+        self.assertEqual("lpg_relevance_freshness_source", payload["ranking"]["strategy"])
+
+        self.store.upsert_news({
+            "article_key": "unconfirmed-news",
+            "headline": "Unconfirmed LPG terminal outage",
+            "source": "discovery fixture", "published_at": now,
+            "relevance_score": 90, "source_tier": 2,
+            "is_breaking": False, "importance": "high",
+            "entitlement_state": "entitled",
+        })
+        unconfirmed = self.service.news({"q": "Unconfirmed"})["items"][0]
+        self.assertEqual("breaking", unconfirmed["freshness"])
+        self.assertFalse(unconfirmed["is_breaking"])
+
+        self.store.upsert_news({
+            "article_key": "undated-news", "headline": "Undated LPG item",
+            "source": "fixture", "published_at": "1970-01-01T00:00:00+00:00",
+            "metadata": {"date_quality": "inferred"},
+            "entitlement_state": "entitled",
+        })
+        undated = self.service.news({"q": "Undated"})["items"][0]
+        self.assertEqual("unknown", undated["freshness"])
+        self.assertFalse(undated["is_breaking"])
+
+        # Simulate an interrupted migration where columns/tables exist but the
+        # version marker was not committed; reinitialization must be recoverable.
+        with self.store._transaction() as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version=3")
+        self.store.initialize()
+
+        with self.store._reader() as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(news)")}
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertTrue({"relevance_score", "rank_score", "source_tier",
+                         "cluster_key", "is_breaking"}.issubset(columns))
+        self.assertEqual(3, version)
 
 
 if __name__ == "__main__":

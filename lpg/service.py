@@ -14,6 +14,28 @@ from .models import json_safe, normalize_date, utc_now
 from .store import LpgStore
 
 
+DERIVED_PROMPT_CURVES = (
+    {
+        "canonical_key": "FEI_PROPANE_PROMPT_STRUCTURE",
+        "name": "CFR North Asia Propane Prompt Half-Month Structure",
+        "components": (
+            ("HM1", "FEI_PROPANE_HM1"),
+            ("HM2", "FEI_PROPANE_HM2"),
+            ("HM3", "FEI_PROPANE_HM3"),
+        ),
+    },
+    {
+        "canonical_key": "CFR_NA_BUTANE_PROMPT_STRUCTURE",
+        "name": "CFR North Asia Butane Prompt Half-Month Structure",
+        "components": (
+            ("HM1", "CFR_NA_BUTANE_HM1"),
+            ("HM2", "CFR_NA_BUTANE_HM2"),
+            ("HM3", "CFR_NA_BUTANE_HM3"),
+        ),
+    },
+)
+
+
 class LpgService:
     def __init__(self, db_path: Optional[Any] = None, store: Optional[LpgStore] = None) -> None:
         self.store = store or LpgStore(db_path)
@@ -33,6 +55,9 @@ class LpgService:
 
     def upsert_news(self, value: Any) -> Dict[str, Any]:
         return self.store.upsert_news(value)
+
+    def upsert_news_source_health(self, value: Mapping[str, Any]) -> Dict[str, Any]:
+        return self.store.upsert_news_source_health(value)
 
     def start_run(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return self.store.start_run(*args, **kwargs)
@@ -77,11 +102,32 @@ class LpgService:
         if series.get("entitlement_state") != "entitled" or not series.get("active"):
             raise PermissionError(f"LPG series is not entitled and active: {series_id}")
         records = self.store.history(series_id, start=start, end=end, limit=limit, bate=bate)
+        if not records:
+            availability = {
+                "status": "empty", "reason": "no_history_observations_in_requested_range",
+                "rows": 0, "dates": 0,
+            }
+        elif len({record["date"] for record in records}) < 2:
+            availability = {
+                "status": "limited", "reason": "single_date_only",
+                "rows": len(records), "dates": 1,
+            }
+        else:
+            availability = {
+                "status": "ready", "reason": None, "rows": len(records),
+                "dates": len({record["date"] for record in records}),
+            }
+        runtime = self._specialized_runtime_statuses().get("history")
+        availability = self._with_runtime_status(availability, runtime)
         return json_safe({
             "series": series,
             "observations": records,
             "statistics": numeric_statistics(records),
             "seasonality": seasonality(records),
+            "availability": availability,
+            "refresh_state": runtime.get("state") if runtime else None,
+            "refresh_reason": self._runtime_reason(runtime),
+            "runtime_status": runtime,
         })
 
     def history(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -101,6 +147,10 @@ class LpgService:
                 "as_of_date": row["as_of_date"],
                 "currency": row.get("currency_normalized") or row.get("currency_native"),
                 "unit": row.get("unit_normalized") or row.get("unit_native"),
+                "curve_kind": "official_fc_curve",
+                "derived": False,
+                "is_official": True,
+                "component_series_ids": [row["series_id"]],
                 "points": [],
             })
             curve["points"].append({
@@ -120,10 +170,155 @@ class LpgService:
                 "entitlement_state": "entitled",
                 "freshness": freshness(row.get("as_of_date")),
             })
-        effective_as_of = normalize_date(as_of) if as_of else max(
-            (curve["as_of_date"] for curve in grouped.values()), default=None
+        derived_curves, derived_diagnostics = self._derived_prompt_curves(
+            as_of=as_of, series_id=series_id,
         )
-        return json_safe({"as_of": effective_as_of, "curves": list(grouped.values())})
+        curves = [*grouped.values(), *derived_curves]
+        effective_as_of = normalize_date(as_of) if as_of else max(
+            (curve["as_of_date"] for curve in curves), default=None
+        )
+        official_count = len(grouped)
+        derived_count = len(derived_curves)
+        if official_count:
+            status, reason = "ready", None
+        elif derived_count:
+            status = "derived_only"
+            reason = "official_curve_points_missing_using_derived_prompt_structure"
+        else:
+            status = "empty"
+            reason = "no_official_curve_points_or_complete_hm1_hm2_hm3_assessments"
+        dataset_status = {
+            "status": status,
+            "reason": reason,
+            "rows": sum(len(curve["points"]) for curve in curves),
+            "dates": len({curve["as_of_date"] for curve in curves}),
+            "series": len(curves),
+        }
+        runtime = self._specialized_runtime_statuses().get("curves")
+        dataset_status = self._with_runtime_status(dataset_status, runtime)
+        return json_safe({
+            "as_of": effective_as_of,
+            "curves": curves,
+            "status": status,
+            "reason": reason,
+            "dataset_status": dataset_status,
+            "refresh_state": runtime.get("state") if runtime else None,
+            "refresh_reason": self._runtime_reason(runtime),
+            "runtime_status": runtime,
+            "official_curve_count": official_count,
+            "official_point_count": sum(len(curve["points"]) for curve in grouped.values()),
+            "derived_curve_count": derived_count,
+            "derived_point_count": sum(len(curve["points"]) for curve in derived_curves),
+            "derived_diagnostics": derived_diagnostics,
+        })
+
+    def _derived_prompt_curves(self, as_of: Optional[str] = None,
+                               series_id: Optional[str] = None) -> tuple[list[Dict[str, Any]],
+                                                                           list[Dict[str, Any]]]:
+        """Compose clearly-labelled prompt structures from current HM assessments.
+
+        The components are licensed assessment series already present in the
+        catalog.  They are only combined when all three tenors are entitled,
+        active, share one current assessment date, currency, and unit.  The
+        result must never be represented as an official Platts FC curve.
+        """
+        curves, diagnostics = [], []
+        for spec in DERIVED_PROMPT_CURVES:
+            components, missing = [], []
+            for tenor, canonical_key in spec["components"]:
+                series = self.store.get_series_by_canonical_key(canonical_key)
+                if (series is None or series.get("entitlement_state") != "entitled" or
+                        not series.get("active")):
+                    missing.append(canonical_key)
+                    continue
+                records = self.store.history(series["id"], end=as_of, limit=1)
+                if not records:
+                    missing.append(canonical_key)
+                    continue
+                components.append({"tenor": tenor, "series": series, "record": records[0]})
+
+            component_ids = [component["series"]["id"] for component in components]
+            if series_id and series_id not in component_ids and series_id != spec["canonical_key"]:
+                continue
+            diagnostic: Dict[str, Any] = {
+                "canonical_key": spec["canonical_key"],
+                "component_series_ids": component_ids,
+                "missing_components": missing,
+            }
+            if missing or len(components) != len(spec["components"]):
+                diagnostic.update({"status": "incomplete", "reason": "missing_or_unentitled_component"})
+                diagnostics.append(diagnostic)
+                continue
+
+            dates = {component["record"]["date"] for component in components}
+            currencies = {component["record"].get("currency") for component in components}
+            units = {component["record"].get("unit") for component in components}
+            if len(dates) != 1:
+                diagnostic.update({
+                    "status": "incomplete", "reason": "component_dates_do_not_match",
+                    "component_dates": sorted(dates),
+                })
+                diagnostics.append(diagnostic)
+                continue
+            if len(currencies) != 1 or len(units) != 1:
+                diagnostic.update({
+                    "status": "incomplete", "reason": "component_units_do_not_match",
+                    "component_currencies": sorted(str(value) for value in currencies),
+                    "component_units": sorted(str(value) for value in units),
+                })
+                diagnostics.append(diagnostic)
+                continue
+
+            curve_date = next(iter(dates))
+            primary_series = components[0]["series"]
+            points = []
+            for component in components:
+                record, source_series = component["record"], component["series"]
+                points.append({
+                    "id": f"derived:{record['id']}",
+                    "as_of_date": curve_date,
+                    "contract_month": component["tenor"],
+                    "tenor": component["tenor"],
+                    "delivery_start": None,
+                    "delivery_end": None,
+                    "value": record["value"],
+                    "native_value": record["native_value"],
+                    "currency": record.get("currency"),
+                    "unit": record.get("unit"),
+                    "fetched_at": record.get("fetched_at"),
+                    "source_ref": record.get("source_ref"),
+                    "is_correction": record.get("is_correction", False),
+                    "entitlement_state": "entitled",
+                    "freshness": freshness(curve_date),
+                    "derived": True,
+                    "curve_kind": "derived_prompt_structure",
+                    "source_series_id": source_series["id"],
+                    "source_canonical_key": source_series.get("canonical_key"),
+                })
+            curves.append({
+                # Use an entitled component as the access-control anchor so
+                # the existing UI catalog filter can validate and display it.
+                "series_id": primary_series["id"],
+                "canonical_key": spec["canonical_key"],
+                "name": spec["name"],
+                "source": "derived_from_current_assessments",
+                "entitlement_state": "entitled",
+                "as_of_date": curve_date,
+                "currency": next(iter(currencies)),
+                "unit": next(iter(units)),
+                "curve_kind": "derived_prompt_structure",
+                "derived": True,
+                "is_official": False,
+                "component_series_ids": component_ids,
+                "methodology": (
+                    "Composed from entitled HM1/HM2/HM3 current assessments; "
+                    "not an official Platts FC curve."
+                ),
+                "points": points,
+            })
+            diagnostic.update({"status": "ready", "reason": None, "as_of_date": curve_date})
+            diagnostics.append(diagnostic)
+        return curves, diagnostics
 
     def spreads(self, as_of: Optional[str] = None, window: int = 252,
                 definitions: Optional[Sequence[Mapping[str, Any]]] = None) -> Dict[str, Any]:
@@ -164,7 +359,70 @@ class LpgService:
         # has marked it entitled.  Metadata about denied access belongs in
         # Data Status, not in the news payload.
         merged["entitlement_state"] = "entitled"
-        return self.store.news(merged)
+        payload = self.store.news(merged)
+        from .news_sources import freshness_metadata
+        freshness_counts: Dict[str, int] = defaultdict(int)
+        for item in payload["items"]:
+            fresh = freshness_metadata(item.get("published_at"))
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+            if str(metadata.get("date_quality") or "reported") not in {
+                "reported", "assumed_utc",
+            }:
+                fresh = {**fresh, "freshness": "unknown", "freshness_score": 0}
+            item.update(fresh)
+            # A high-impact discovery hit is not automatically confirmed.
+            # Ingestion only persists is_breaking after the official/multi-source
+            # confirmation rule has been applied; query-time freshness may age a
+            # confirmed item out, but must never promote an unconfirmed one.
+            item["is_breaking"] = bool(
+                fresh["freshness"] == "breaking" and item.get("is_breaking")
+            )
+            item["rank_score"] = round(
+                float(item.get("relevance_score") or 0) * 0.68
+                + float(fresh["freshness_score"]) * 0.22
+                + int(item.get("source_tier") or 0) * 2
+                + (8 if item["is_breaking"] else 0), 2,
+            )
+            freshness_counts[fresh["freshness"]] += 1
+        payload["items"].sort(
+            key=lambda item: (bool(item.get("is_breaking")),
+                              float(item.get("rank_score") or 0),
+                              str(item.get("published_at") or "")),
+            reverse=True,
+        )
+        payload["freshness"] = dict(freshness_counts)
+        payload["source_health"] = self._news_source_health()
+        payload["source_status"] = {
+            "healthy": sum(row.get("status") in {"healthy", "empty"}
+                           for row in payload["source_health"]),
+            "stale": sum(row.get("status") == "stale" for row in payload["source_health"]),
+            "failed": sum(row.get("status") == "error" for row in payload["source_health"]),
+            "total": len(payload["source_health"]),
+        }
+        payload["ranking"] = {
+            "strategy": "lpg_relevance_freshness_source",
+            "entitlement_boundary": "platts_api_separate_public_sources_labelled",
+        }
+        return json_safe(payload)
+
+    def _news_source_health(self) -> list[Dict[str, Any]]:
+        from .news_sources import freshness_metadata
+        rows = self.store.news_source_health()
+        for row in rows:
+            attempt = freshness_metadata(row["last_attempt_at"]) if row.get("last_attempt_at") else None
+            latest = freshness_metadata(row["latest_published_at"]) if row.get("latest_published_at") else None
+            if attempt:
+                row["attempt_age_minutes"] = attempt["age_minutes"]
+                row["stale"] = attempt["age_minutes"] > 30
+                if row["stale"] and row.get("status") in {"healthy", "empty"}:
+                    row["stored_status"] = row["status"]
+                    row["status"] = "stale"
+            else:
+                row["stale"] = True
+            if latest:
+                row["latest_age_minutes"] = latest["age_minutes"]
+                row["latest_freshness"] = latest["freshness"]
+        return rows
 
     def explorer(self, dataset: str = "observations", **filters: Any) -> Dict[str, Any]:
         dataset = str(dataset or "observations").lower()
@@ -189,8 +447,28 @@ class LpgService:
             offset = max(0, int(filters.get("offset") or 0))
             page = rows[offset:offset + limit]
             columns = list(page[0]) if page else []
-            return json_safe({"dataset": dataset, "columns": columns, "rows": page,
-                              "total": len(rows), "limit": limit, "offset": offset})
+            dataset_status = {
+                "status": "ready" if rows else "empty",
+                "reason": None if rows else (
+                    "no_fundamentals_rows" if dataset == "fundamentals" else "no_moc_rows"
+                ),
+                "rows": len(rows),
+                "dates": len({row.get("as_of_date") for row in rows if row.get("as_of_date")}),
+                "series": len({row.get("series_id") for row in rows if row.get("series_id")}),
+            }
+            runtime = (
+                self._specialized_runtime_statuses().get("moc")
+                if dataset in {"moc", "all"} else None
+            )
+            dataset_status = self._with_runtime_status(dataset_status, runtime)
+            return json_safe({
+                "dataset": dataset, "columns": columns, "rows": page,
+                "total": len(rows), "limit": limit, "offset": offset,
+                "dataset_status": dataset_status,
+                "refresh_state": runtime.get("state") if runtime else None,
+                "refresh_reason": self._runtime_reason(runtime),
+                "runtime_status": runtime,
+            })
         if dataset == "spreads":
             rows = self.spreads(as_of=as_of or filters.get("end"))["items"]
             return self._rows_payload(dataset, rows, filters)
@@ -233,10 +511,126 @@ class LpgService:
                 "error": ", ".join(runtime.get("reason_codes") or []) or None,
             })
         status["sources"] = sources
+        status["news_sources"] = self._news_source_health()
         status["runtime"] = runtime
         status["news_api_configured"] = news_configured
         status["entitlement_matrix"] = self.store.candidates()
+        specialized = self._specialized_runtime_statuses()
+        status["specialized_runtime"] = specialized
+        status["datasets"] = self._dataset_health(status.get("datasets"), specialized)
         return json_safe(status)
+
+    def _dataset_health(self, stored: Optional[Mapping[str, Any]] = None,
+                        specialized: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Enrich persisted coverage metrics with official/derived curve availability."""
+        datasets = {
+            str(key): dict(value) for key, value in dict(stored or {}).items()
+            if isinstance(value, Mapping)
+        }
+        curves = self.curves()
+        all_curves = curves["curves"]
+        curve_dates = sorted({
+            str(curve["as_of_date"]) for curve in all_curves if curve.get("as_of_date")
+        })
+        official = [curve for curve in all_curves if curve.get("is_official")]
+        derived = [curve for curve in all_curves if curve.get("derived")]
+        datasets["curves"] = {
+            "rows": sum(len(curve.get("points") or []) for curve in all_curves),
+            "dates": len(curve_dates),
+            "series": len(all_curves),
+            "first_date": curve_dates[0] if curve_dates else None,
+            "last_date": curve_dates[-1] if curve_dates else None,
+            "official_rows": sum(len(curve.get("points") or []) for curve in official),
+            "official_series": len(official),
+            "derived_rows": sum(len(curve.get("points") or []) for curve in derived),
+            "derived_series": len(derived),
+            "status": curves["status"],
+            "reason": curves["reason"],
+        }
+        for name in ("history", "curves", "moc"):
+            runtime = dict(specialized or {}).get(name)
+            if name in datasets and isinstance(runtime, Mapping):
+                datasets[name] = self._with_runtime_status(datasets[name], runtime)
+        return datasets
+
+    @staticmethod
+    def _runtime_reason(runtime: Optional[Mapping[str, Any]]) -> Optional[str]:
+        if not runtime:
+            return None
+        reasons = runtime.get("reason_codes")
+        if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)):
+            joined = ", ".join(str(reason) for reason in reasons if reason)
+            if joined:
+                return joined
+        return str(runtime.get("reason") or runtime.get("error") or "").strip() or None
+
+    @classmethod
+    def _with_runtime_status(cls, coverage: Mapping[str, Any],
+                             runtime: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        output = dict(coverage)
+        if not runtime:
+            return output
+        state = str(runtime.get("state") or runtime.get("status") or "unknown").lower()
+        reason = cls._runtime_reason(runtime)
+        output.update({
+            "refresh_state": state,
+            "refresh_reason": reason,
+            "runtime_status": dict(runtime),
+        })
+        if state in {"error", "failed", "blocked", "refresh_failed"}:
+            output.update({
+                "status": "refresh_failed",
+                "reason": reason or "specialized_refresh_failed",
+            })
+        elif state in {"deferred", "not_run", "not_loaded", "pending", "queued",
+                       "running", "in_progress", "unknown"} and not output.get("rows"):
+            output.update({
+                "status": "not_loaded",
+                "reason": reason or f"specialized_refresh_{state}",
+            })
+        elif state in {"partial", "partial_success"}:
+            output.update({
+                "status": "partial",
+                "reason": reason or output.get("reason"),
+            })
+        return output
+
+    @staticmethod
+    def _specialized_runtime_statuses() -> Dict[str, Dict[str, Any]]:
+        try:
+            from .platts_excel import STAGING_DIR
+        except Exception:
+            return {}
+        locations = {
+            "history": "backfill",
+            "curves": "curve",
+            "moc": "moc",
+        }
+        output: Dict[str, Dict[str, Any]] = {}
+        for dataset, purpose in locations.items():
+            path = Path(STAGING_DIR) / purpose / "status.json"
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("specialized status payload is not an object")
+                output[dataset] = {
+                    **dict(payload),
+                    "dataset": dataset,
+                    "purpose": purpose,
+                    "status_path": str(path),
+                }
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                output[dataset] = {
+                    "dataset": dataset,
+                    "purpose": purpose,
+                    "state": "failed",
+                    "reason_codes": ["invalid_specialized_status_file"],
+                    "error": str(exc)[:500],
+                    "status_path": str(path),
+                }
+        return json_safe(output)
 
     @staticmethod
     def _flatten_dataset_row(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -365,20 +759,36 @@ class LpgService:
         entitlement_by_symbol: Mapping[str, Mapping[str, Any]],
     ) -> Dict[str, Any]:
         source = str(record.get("source") or "platts_excel")
-        symbol = str(record.get("symbol") or record.get("data_series") or "").strip() or None
+        record_type = str(record.get("record_type") or "price_observation")
+        explicit_series_id = str(record.get("series_id") or "").strip() or None
+        row_symbol = str(record.get("symbol") or record.get("data_series") or "").strip() or None
+        # FC rows commonly carry a contract code in ``symbol``.  That value is
+        # point identity, not series identity; use the stable curve code (or
+        # explicit manifest series id) so each official curve remains distinct.
+        symbol = (
+            str(record.get("curve_code") or explicit_series_id).strip() or None
+            if record_type == "curve_point"
+            else row_symbol
+        )
         existing: Mapping[str, Any] = {}
-        if record.get("series_id"):
-            existing = self.store.get_series(str(record["series_id"])) or {}
-        if not existing and symbol:
+        if explicit_series_id:
+            existing = self.store.get_series(explicit_series_id) or {}
+        if not existing and symbol and not (
+            explicit_series_id and record_type == "curve_point"
+        ):
             existing = self.store.get_series_by_symbol(source, symbol) or {}
-        entitlement = (entitlement_by_symbol.get(symbol or "") or
+        entitlement = (entitlement_by_symbol.get(row_symbol or "") or
+                       entitlement_by_symbol.get(symbol or "") or
                        entitlement_by_symbol.get(str(record.get("canonical_key") or ""), {}))
         canonical_key = (record.get("canonical_key") or entitlement.get("canonical_key") or
                          entitlement.get("candidate_id"))
         candidate = candidate_by_key.get(str(canonical_key), {}) if canonical_key else {}
         if canonical_key and candidate:
             canonical_key = candidate["canonical_key"]
-        series_id = str(existing.get("id") or self._series_id(record))
+        series_id = str(
+            explicit_series_id if record_type == "curve_point" and explicit_series_id
+            else existing.get("id") or self._series_id(record)
+        )
         native = self._native_and_normalized(record)
         return self.store.upsert_series({
             "id": series_id,
@@ -492,6 +902,15 @@ class LpgService:
             mapped_series_id = entitlement.get("series_id")
             symbol = str(entitlement.get("symbol") or entitlement.get("data_series") or "").strip()
             if candidate_key in candidate_by_key:
+                candidate = candidate_by_key[candidate_key]
+                data_series = str(entitlement.get("data_series") or "").strip().lower()
+                # MD entitlement is data-series specific.  A failed or denied
+                # History-Symbol probe must not erase proven Current-Symbol
+                # access in the candidate-level compatibility field.
+                if (data_series == "history-symbol"
+                        and candidate.get("discovery_status") == "entitled"
+                        and state != "entitled"):
+                    continue
                 try:
                     self.store.update_candidate_entitlement(
                         str(candidate_key), state, str(mapped_series_id) if mapped_series_id else None,
@@ -506,12 +925,12 @@ class LpgService:
             try:
                 if not isinstance(record, Mapping):
                     raise ValueError("record is not an object")
-                series = self._ensure_staging_series(
-                    record, candidate_by_key, entitlement_by_symbol
-                )
                 record_type = str(record.get("record_type") or "price_observation")
-                native = self._native_and_normalized(record)
                 if record_type in {"price_observation", "correction"}:
+                    series = self._ensure_staging_series(
+                        record, candidate_by_key, entitlement_by_symbol
+                    )
+                    native = self._native_and_normalized(record)
                     output = self.store.upsert_observation({
                         "series_id": series["id"],
                         "observation_date": record.get("assess_date"),
@@ -526,8 +945,14 @@ class LpgService:
                                      if key not in {"value"}},
                     })
                 elif record_type == "curve_point":
+                    series = self._ensure_staging_series(
+                        record, candidate_by_key, entitlement_by_symbol
+                    )
+                    native = self._native_and_normalized(record)
                     contract = str(record.get("contract_label") or
-                                   record.get("contract_date") or "").strip()
+                                   record.get("contract_date") or
+                                   record.get("contract_code") or
+                                   record.get("symbol") or "").strip()
                     if not contract:
                         raise ValueError("curve point has no contract label/date")
                     output = self.store.upsert_curve_point({
@@ -546,9 +971,7 @@ class LpgService:
                     dataset = "platts_ewindow" if record_type.startswith("ewindow") else str(
                         record.get("dataset") or "platts_fundamentals"
                     )
-                    row_seed = json.dumps(json_safe(dict(record)), sort_keys=True, ensure_ascii=True)
-                    row_key = str(record.get("row_key") or
-                                  hashlib.sha1(row_seed.encode("utf-8")).hexdigest())
+                    row_key = self._dataset_row_key(record, dataset)
                     output = self.store.upsert_dataset_row({
                         "dataset": dataset,
                         "row_key": row_key,
@@ -614,3 +1037,37 @@ class LpgService:
             "discovery_rows": discovery_rows,
             "errors": errors,
         })
+
+    @staticmethod
+    def _dataset_row_key(record: Mapping[str, Any], dataset: str) -> str:
+        """Return a stable identity for supplemental rows.
+
+        eWindow payloads are mutable snapshots of an order. Hashing the full
+        record makes every price/status update look like a new order, so MOC
+        rows use the provider's order id when available. Older or partial
+        responses without an order id fall back to immutable order dimensions
+        and deliberately exclude value, volume, status, and update time.
+        """
+        explicit = str(record.get("row_key") or "").strip()
+        if explicit:
+            return explicit
+
+        if dataset == "platts_ewindow":
+            order_id = str(record.get("order_id") or "").strip()
+            if order_id:
+                return order_id
+            identity_fields = (
+                "record_type", "series_id", "canonical_key", "candidate_id",
+                "scope", "data_series", "order_time", "symbol", "market",
+                "product", "hub", "strip", "source_ref", "description",
+            )
+            identity = {
+                key: json_safe(record.get(key))
+                for key in identity_fields
+                if record.get(key) not in (None, "")
+            }
+            seed = json.dumps(identity, sort_keys=True, ensure_ascii=True)
+            return f"moc:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
+
+        row_seed = json.dumps(json_safe(dict(record)), sort_keys=True, ensure_ascii=True)
+        return hashlib.sha1(row_seed.encode("utf-8")).hexdigest()

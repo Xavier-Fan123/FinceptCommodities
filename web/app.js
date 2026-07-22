@@ -7,6 +7,7 @@ const SECTOR_LABEL = {
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const LPG_VIEWS = [
   { id: "cockpit", label: "Cockpit" },
+  { id: "situation", label: "Situation Map" },
   { id: "curves", label: "Curves & Spreads" },
   { id: "history", label: "History & Seasonality" },
   { id: "moc", label: "MOC & Fundamentals" },
@@ -70,6 +71,13 @@ let state = {
   lpgNewsFilter: {
     query: "", region: "all", topic: "all", source: "all",
     impact: "all", product: "all", direction: "all",
+  },
+  lpgSituation: {
+    severity: "all", eventType: "all", region: "all", confirmation: "all",
+    query: "", selectedEventKey: null, selectedVesselId: null,
+    layers: { events: true, assets: true, routes: true, vessels: true },
+    selectedScenarioId: null, scenarioInputs: {}, scenarioResult: null,
+    scenarioLoading: false, scenarioError: null,
   },
   lpgNewsAutoRefresh: true,
   lpgNewsAutoTimer: null,
@@ -1378,7 +1386,7 @@ function renderLpgShell() {
     updateLpgExportLinks();
   };
   const fundamentalsUnavailable = state.lpgView === "moc" && state.lpgMocDataset === "fundamentals";
-  const scopeConfig = state.lpgView === "news"
+  const scopeConfig = ["news", "situation"].includes(state.lpgView)
     ? [["news", "News sources / 新闻源"]]
     : state.lpgView === "history"
       ? [["history", "History backfill / 历史回填"]]
@@ -1438,6 +1446,14 @@ function updateLpgExportLinks() {
     }
     if (filter.impact && filter.impact !== "all") query.set("importance", filter.impact);
   }
+  if (state.lpgView === "situation") {
+    const filter = state.lpgSituation;
+    if (filter.query) query.set("q", filter.query);
+    if (filter.severity !== "all") query.set("severity", filter.severity);
+    if (filter.eventType !== "all") query.set("event_type", filter.eventType);
+    if (filter.region !== "all") query.set("region", filter.region);
+    if (filter.confirmation !== "all") query.set("confirmation_state", filter.confirmation);
+  }
   const csv = byId("lpg-export-csv"), xlsx = byId("lpg-export-xlsx");
   if (csv) csv.href = `/api/lpg/export?${query.toString()}&format=csv`;
   if (xlsx) xlsx.href = `/api/lpg/export?${query.toString()}&format=xlsx`;
@@ -1459,7 +1475,7 @@ function lpgEntitledCatalogUrl() {
 }
 
 function lpgExplorerAsOfParam(dataset) {
-  return ["observations", "curves", "news", "dataset_rows"].includes(dataset) ? "end" : null;
+  return ["observations", "curves", "news", "events", "dataset_rows"].includes(dataset) ? "end" : null;
 }
 
 async function lpgLoadSettled(requests) {
@@ -1581,6 +1597,10 @@ async function loadLpgView(view, options = {}) {
       });
       payload = { ...(values.data || {}), access_catalog: values.catalog || null, _load_errors: errors };
     }
+    else if (view === "situation") payload = await fetchJSON(lpgApiUrl("situation", {
+      limit: 500,
+      _ts: options.cacheBust ? Date.now() : "",
+    }, { asOf: "end" }));
     else if (view === "news") payload = await fetchJSON(lpgApiUrl("news", {
       limit: 500,
       fresh: options.fresh ? 1 : "",
@@ -1602,6 +1622,12 @@ async function loadLpgView(view, options = {}) {
     state.lpgData[view] = lpgPayload(payload);
     if (view === "news") state.lpgNewsLastLoadedAt = Date.now();
     if (view === "cockpit") renderLpgCockpit(state.lpgData[view]);
+    else if (view === "situation") {
+      if (!window.FinceptLpgSituation) throw new Error("Situation renderer did not load");
+      window.FinceptLpgSituation.render(state.lpgData[view], state.lpgSituation, {
+        body: byId("lpg-body"), formatDate: lpgDate, requestJSON,
+      });
+    }
     else if (view === "curves") renderLpgCurves(state.lpgData[view]);
     else if (view === "moc") renderLpgMoc(state.lpgData[view]);
     else if (view === "news") renderLpgNews(state.lpgData[view]);
@@ -2542,7 +2568,7 @@ function renderLpgExplorer(data) {
   const explorer = state.lpgExplorer;
   const form = el("form", { class: "lpg-toolbar lpg-explorer-toolbar" });
   const dataset = el("select", { "aria-label": "Explorer dataset" });
-  for (const item of ["series", "observations", "curves", "spreads", "news", "candidates", "revisions", "runs"]) {
+  for (const item of ["series", "observations", "curves", "spreads", "events", "news", "candidates", "revisions", "runs"]) {
     dataset.appendChild(el("option", { value: item, text: item[0].toUpperCase() + item.slice(1) }));
   }
   dataset.value = explorer.dataset;

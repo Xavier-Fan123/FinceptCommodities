@@ -29,7 +29,7 @@ DEFAULT_DB_PATH = Path(
         Path(__file__).resolve().parents[1] / "data" / "private" / "lpg.sqlite",
     )
 )
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # Platts can return several BATE values for the same assessment.  The official
 # close (c) is the trading default, followed by u/e/l/h.  Keep the preference
@@ -294,6 +294,181 @@ def _apply_migration_3(connection: sqlite3.Connection) -> None:
     )
 
 
+_INTELLIGENCE_V4_DDL = r"""
+CREATE TABLE IF NOT EXISTS intelligence_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    headline TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('critical','high','medium','low')),
+    risk_score INTEGER NOT NULL DEFAULT 0 CHECK (risk_score BETWEEN 0 AND 100),
+    confirmation_state TEXT NOT NULL CHECK (confirmation_state IN ('confirmed','developing')),
+    confidence_score INTEGER NOT NULL DEFAULT 0 CHECK (confidence_score BETWEEN 0 AND 100),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    latitude REAL,
+    longitude REAL,
+    location_name TEXT,
+    geo_precision TEXT NOT NULL DEFAULT 'unresolved',
+    region TEXT,
+    direction TEXT NOT NULL DEFAULT 'neutral',
+    source_count INTEGER NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 1,
+    active INTEGER NOT NULL DEFAULT 1,
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    asset_ids_json TEXT NOT NULL DEFAULT '[]',
+    route_ids_json TEXT NOT NULL DEFAULT '[]',
+    products_json TEXT NOT NULL DEFAULT '[]',
+    affected_series_json TEXT NOT NULL DEFAULT '[]',
+    impact_json TEXT NOT NULL DEFAULT '{}',
+    data_gaps_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_intelligence_event_rank
+    ON intelligence_events(active DESC, risk_score DESC, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intelligence_event_type
+    ON intelligence_events(event_type, severity, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intelligence_event_region
+    ON intelligence_events(region, last_seen_at DESC);
+"""
+
+_INTELLIGENCE_EVENT_COLUMNS = (
+    "event_key", "headline", "event_type", "severity", "risk_score",
+    "confirmation_state", "confidence_score", "first_seen_at", "last_seen_at",
+    "latitude", "longitude", "location_name", "geo_precision", "region",
+    "direction", "source_count", "evidence_count", "active", "sources_json",
+    "asset_ids_json", "route_ids_json", "products_json", "affected_series_json",
+    "impact_json", "data_gaps_json", "evidence_json", "metadata_json",
+)
+
+_INTELLIGENCE_EVENT_UPSERT = f"""INSERT INTO intelligence_events
+    ({','.join(_INTELLIGENCE_EVENT_COLUMNS)},created_at,updated_at)
+    VALUES ({','.join('?' for _ in _INTELLIGENCE_EVENT_COLUMNS)},?,?)
+    ON CONFLICT(event_key) DO UPDATE SET
+        headline=excluded.headline,event_type=excluded.event_type,
+        severity=excluded.severity,risk_score=excluded.risk_score,
+        confirmation_state=excluded.confirmation_state,
+        confidence_score=excluded.confidence_score,
+        first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,
+        latitude=excluded.latitude,longitude=excluded.longitude,
+        location_name=excluded.location_name,geo_precision=excluded.geo_precision,
+        region=excluded.region,direction=excluded.direction,
+        source_count=excluded.source_count,evidence_count=excluded.evidence_count,
+        active=excluded.active,sources_json=excluded.sources_json,
+        asset_ids_json=excluded.asset_ids_json,route_ids_json=excluded.route_ids_json,
+        products_json=excluded.products_json,
+        affected_series_json=excluded.affected_series_json,
+        impact_json=excluded.impact_json,data_gaps_json=excluded.data_gaps_json,
+        evidence_json=excluded.evidence_json,metadata_json=excluded.metadata_json,
+        updated_at=excluded.updated_at"""
+
+
+_VESSEL_V5_DDL = r"""
+CREATE TABLE IF NOT EXISTS vessels (
+    vessel_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    imo TEXT UNIQUE,
+    mmsi TEXT UNIQUE,
+    vessel_type TEXT,
+    fleet_group TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vessel_port_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_key TEXT NOT NULL UNIQUE,
+    vessel_id TEXT NOT NULL REFERENCES vessels(vessel_id) ON DELETE CASCADE,
+    port_name TEXT NOT NULL,
+    port_name_local TEXT,
+    locode TEXT,
+    country TEXT,
+    country_code TEXT,
+    arrived_at TEXT,
+    berthed_at TEXT,
+    departed_at TEXT,
+    timestamp_state TEXT NOT NULL,
+    source_timezone TEXT,
+    stay_hours REAL,
+    latitude REAL,
+    longitude REAL,
+    geo_precision TEXT NOT NULL DEFAULT 'unavailable',
+    draught_arrival REAL,
+    draught_departure REAL,
+    draught_change REAL,
+    operation_signal TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (operation_signal IN ('loaded','discharged','no_major_change','unknown')),
+    operation_signal_state TEXT NOT NULL DEFAULT 'unavailable',
+    next_destination TEXT,
+    source TEXT NOT NULL,
+    source_detail TEXT,
+    evidence_state TEXT NOT NULL DEFAULT 'source_reported',
+    source_snapshot_at TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    ingestion_run_id INTEGER REFERENCES ingestion_runs(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vessel_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_key TEXT NOT NULL UNIQUE,
+    vessel_id TEXT NOT NULL REFERENCES vessels(vessel_id) ON DELETE CASCADE,
+    observed_at TEXT NOT NULL,
+    timestamp_state TEXT NOT NULL,
+    latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+    longitude REAL NOT NULL CHECK (longitude BETWEEN -180 AND 180),
+    speed_kn REAL,
+    course_deg REAL,
+    navigation_state TEXT,
+    destination TEXT,
+    position_kind TEXT NOT NULL DEFAULT 'historical'
+        CHECK (position_kind IN ('live','recent','historical')),
+    source TEXT NOT NULL,
+    evidence_state TEXT NOT NULL DEFAULT 'source_reported',
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    ingestion_run_id INTEGER REFERENCES ingestion_runs(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vessel_source_health (
+    source_id TEXT PRIMARY KEY,
+    source_name TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    access_state TEXT NOT NULL,
+    status TEXT NOT NULL,
+    entitlement_state TEXT NOT NULL DEFAULT 'unverified',
+    last_attempt_at TEXT NOT NULL,
+    last_success_at TEXT,
+    latest_observation_at TEXT,
+    vessel_count INTEGER NOT NULL DEFAULT 0,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vessel_calls_vessel_time
+    ON vessel_port_calls(vessel_id, arrived_at DESC, departed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vessel_calls_port_time
+    ON vessel_port_calls(locode, port_name, arrived_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vessel_positions_vessel_time
+    ON vessel_positions(vessel_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vessel_source_status
+    ON vessel_source_health(status, latest_observation_at DESC);
+"""
+
+
 def _limit(value: Any, default: int = 500, maximum: int = 5000) -> int:
     try:
         number = int(value)
@@ -375,6 +550,18 @@ class LpgStore:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (3, now),
+                )
+            if 4 not in applied:
+                connection.executescript(_INTELLIGENCE_V4_DDL)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (4, now),
+                )
+            if 5 not in applied:
+                connection.executescript(_VESSEL_V5_DDL)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, now),
                 )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.seed_candidates()
@@ -1024,6 +1211,430 @@ class LpgStore:
             ).fetchall()
         return [self._record(row) for row in rows]
 
+    def upsert_intelligence_event(self, value: Mapping[str, Any]) -> Dict[str, Any]:
+        from .intelligence import normalize_event_for_store
+
+        item = normalize_event_for_store(value)
+        now = utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT id FROM intelligence_events WHERE event_key=?", (item["event_key"],),
+            ).fetchone()
+            connection.execute(_INTELLIGENCE_EVENT_UPSERT, [
+                item.get(column) for column in _INTELLIGENCE_EVENT_COLUMNS
+            ] + [now, item["updated_at"]])
+            row = connection.execute(
+                "SELECT * FROM intelligence_events WHERE event_key=?", (item["event_key"],),
+            ).fetchone()
+        output = self._record(row)
+        output["action"] = "updated" if existing else "inserted"
+        return output
+
+    def upsert_intelligence_events(self, values: Iterable[Mapping[str, Any]]) -> Dict[str, int]:
+        """Persist a complete derived-event batch in one SQLite transaction."""
+        from .intelligence import normalize_event_for_store
+
+        items = [normalize_event_for_store(value) for value in values]
+        counts = {"seen": len(items), "inserted": 0, "updated": 0}
+        if not items:
+            return counts
+        now = utc_now()
+        with self._transaction() as connection:
+            existing = {
+                row[0] for row in connection.execute(
+                    "SELECT event_key FROM intelligence_events",
+                )
+            }
+            for item in items:
+                connection.execute(_INTELLIGENCE_EVENT_UPSERT, [
+                    item.get(column) for column in _INTELLIGENCE_EVENT_COLUMNS
+                ] + [now, item["updated_at"]])
+                counts["updated" if item["event_key"] in existing else "inserted"] += 1
+        return counts
+
+    def intelligence_events(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        filters = dict(filters or {})
+        where, params = [], []
+        for field in ("event_type", "severity", "region", "confirmation_state"):
+            if filters.get(field) not in (None, "", "all"):
+                where.append(f"{field}=?")
+                params.append(filters[field])
+        if filters.get("active") not in (None, "", "all"):
+            where.append("active=?")
+            params.append(1 if str(filters["active"]).lower() in {"1", "true", "yes"} else 0)
+        if filters.get("start"):
+            where.append("last_seen_at>=?")
+            params.append(normalize_timestamp(filters["start"]) or str(filters["start"]))
+        if filters.get("end"):
+            end = str(filters["end"])
+            where.append("last_seen_at<?")
+            params.append(end[:10] + "T23:59:59+00:00" if len(end) <= 10 else
+                          normalize_timestamp(end) or end)
+        if filters.get("asset_id"):
+            where.append("asset_ids_json LIKE ?")
+            params.append(f'%"{str(filters["asset_id"])}"%')
+        if filters.get("route_id"):
+            where.append("route_ids_json LIKE ?")
+            params.append(f'%"{str(filters["route_id"])}"%')
+        if filters.get("q"):
+            where.append("(headline LIKE ? OR location_name LIKE ? OR sources_json LIKE ? "
+                         "OR affected_series_json LIKE ? OR evidence_json LIKE ?)")
+            term = f"%{filters['q']}%"
+            params.extend([term] * 5)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        limit, offset = _limit(filters.get("limit"), 300), _offset(filters.get("offset"))
+        with self._reader() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM intelligence_events{clause}", params,
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""SELECT * FROM intelligence_events{clause}
+                    ORDER BY active DESC,risk_score DESC,last_seen_at DESC,id DESC
+                    LIMIT ? OFFSET ?""",
+                params + [limit, offset],
+            ).fetchall()
+        return {
+            "items": [self._record(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "filters": {key: value for key, value in filters.items() if value not in (None, "")},
+        }
+
+    def intelligence_status(self) -> Dict[str, Any]:
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) total,
+                          SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) active,
+                          SUM(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) located,
+                          SUM(CASE WHEN confirmation_state='confirmed' THEN 1 ELSE 0 END) confirmed,
+                          MAX(last_seen_at) latest_event_at,MAX(updated_at) last_sync_at
+                   FROM intelligence_events"""
+            ).fetchone()
+        return json_safe(dict(row) if row else {
+            "total": 0, "active": 0, "located": 0, "confirmed": 0,
+            "latest_event_at": None, "last_sync_at": None,
+        })
+
+    def intelligence_needs_sync(self) -> bool:
+        with self._reader() as connection:
+            news = connection.execute(
+                "SELECT COUNT(*) total,MAX(updated_at) latest FROM news "
+                "WHERE entitlement_state='entitled'",
+            ).fetchone()
+            events = connection.execute(
+                "SELECT COUNT(*) total,MAX(updated_at) latest FROM intelligence_events",
+            ).fetchone()
+        if not news or not int(news["total"] or 0):
+            return False
+        return not events or not int(events["total"] or 0) or str(news["latest"] or "") > str(events["latest"] or "")
+
+    def import_vessel_snapshot(self, snapshot: Mapping[str, Any],
+                               ingestion_run_id: Optional[int] = None) -> Dict[str, int]:
+        """Persist a normalized vessel snapshot without creating live positions."""
+        vessels = [dict(item) for item in snapshot.get("vessels") or []]
+        calls = [dict(item) for item in snapshot.get("port_calls") or []]
+        health = [dict(item) for item in snapshot.get("source_health") or []]
+        counts = {
+            "vessels_seen": len(vessels), "vessels_inserted": 0,
+            "vessels_updated": 0, "vessels_unchanged": 0,
+            "port_calls_seen": len(calls), "port_calls_inserted": 0,
+            "port_calls_updated": 0, "port_calls_unchanged": 0,
+            "positions_inserted": 0,
+        }
+        now = utc_now()
+        with self._transaction() as connection:
+            for item in vessels:
+                vessel_id = str(item.get("vessel_id") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if not vessel_id or not name:
+                    raise ValueError("vessel_id and name are required")
+                values = (
+                    name, item.get("imo"), item.get("mmsi"), item.get("vessel_type"),
+                    item.get("fleet_group"), 1 if item.get("active", True) else 0,
+                    json.dumps(json_safe(item.get("metadata") or {}), ensure_ascii=True),
+                )
+                existing = connection.execute(
+                    "SELECT name,imo,mmsi,vessel_type,fleet_group,active,metadata_json "
+                    "FROM vessels WHERE vessel_id=?", (vessel_id,),
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        """INSERT INTO vessels
+                           (vessel_id,name,imo,mmsi,vessel_type,fleet_group,active,
+                            metadata_json,created_at,updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (vessel_id, *values, now, now),
+                    )
+                    counts["vessels_inserted"] += 1
+                elif tuple(existing) == values:
+                    counts["vessels_unchanged"] += 1
+                else:
+                    connection.execute(
+                        """UPDATE vessels SET name=?,imo=?,mmsi=?,vessel_type=?,fleet_group=?,
+                           active=?,metadata_json=?,updated_at=? WHERE vessel_id=?""",
+                        (*values, now, vessel_id),
+                    )
+                    counts["vessels_updated"] += 1
+
+            call_columns = (
+                "call_key", "vessel_id", "port_name", "port_name_local", "locode",
+                "country", "country_code", "arrived_at", "berthed_at", "departed_at",
+                "timestamp_state", "source_timezone", "stay_hours", "latitude", "longitude",
+                "geo_precision", "draught_arrival", "draught_departure", "draught_change",
+                "operation_signal", "operation_signal_state", "next_destination", "source",
+                "source_detail", "evidence_state", "source_snapshot_at", "evidence_hash",
+                "raw_json", "metadata_json", "ingestion_run_id",
+            )
+            for item in calls:
+                call_key = str(item.get("call_key") or "").strip()
+                if not call_key or not item.get("vessel_id") or not item.get("port_name"):
+                    raise ValueError("call_key, vessel_id, and port_name are required")
+                item["raw_json"] = json.dumps(
+                    json_safe(item.pop("raw", item.get("raw_json") or {})), ensure_ascii=True,
+                )
+                item["metadata_json"] = json.dumps(
+                    json_safe(item.pop("metadata", item.get("metadata_json") or {})), ensure_ascii=True,
+                )
+                item["ingestion_run_id"] = ingestion_run_id
+                existing = connection.execute(
+                    "SELECT evidence_hash FROM vessel_port_calls WHERE call_key=?", (call_key,),
+                ).fetchone()
+                values = [item.get(column) for column in call_columns]
+                if existing is None:
+                    connection.execute(
+                        f"""INSERT INTO vessel_port_calls
+                            ({','.join(call_columns)},created_at,updated_at)
+                            VALUES ({','.join('?' for _ in call_columns)},?,?)""",
+                        values + [now, now],
+                    )
+                    counts["port_calls_inserted"] += 1
+                elif str(existing["evidence_hash"]) == str(item.get("evidence_hash")):
+                    counts["port_calls_unchanged"] += 1
+                else:
+                    assignments = ",".join(
+                        f"{column}=?" for column in call_columns if column != "call_key"
+                    )
+                    connection.execute(
+                        f"UPDATE vessel_port_calls SET {assignments},updated_at=? WHERE call_key=?",
+                        [item.get(column) for column in call_columns if column != "call_key"]
+                        + [now, call_key],
+                    )
+                    counts["port_calls_updated"] += 1
+
+            for item in health:
+                source_id = str(item.get("source_id") or "").strip()
+                source_name = str(item.get("source_name") or source_id).strip()
+                if not source_id or not source_name:
+                    raise ValueError("vessel source_id and source_name are required")
+                connection.execute(
+                    """INSERT INTO vessel_source_health
+                       (source_id,source_name,capabilities_json,access_state,status,
+                        entitlement_state,last_attempt_at,last_success_at,latest_observation_at,
+                        vessel_count,row_count,error,metadata_json,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(source_id) DO UPDATE SET
+                         source_name=excluded.source_name,
+                         capabilities_json=excluded.capabilities_json,
+                         access_state=excluded.access_state,status=excluded.status,
+                         entitlement_state=excluded.entitlement_state,
+                         last_attempt_at=excluded.last_attempt_at,
+                         last_success_at=excluded.last_success_at,
+                         latest_observation_at=excluded.latest_observation_at,
+                         vessel_count=excluded.vessel_count,row_count=excluded.row_count,
+                         error=excluded.error,metadata_json=excluded.metadata_json,
+                         updated_at=excluded.updated_at""",
+                    (
+                        source_id, source_name,
+                        json.dumps(json_safe(item.get("capabilities") or []), ensure_ascii=True),
+                        str(item.get("access_state") or "unknown"),
+                        str(item.get("status") or "unknown"),
+                        str(item.get("entitlement_state") or "unverified"),
+                        str(item.get("last_attempt_at") or now), item.get("last_success_at"),
+                        item.get("latest_observation_at"), max(0, int(item.get("vessel_count") or 0)),
+                        max(0, int(item.get("row_count") or 0)),
+                        str(item.get("error"))[:1000] if item.get("error") else None,
+                        json.dumps(json_safe(item.get("metadata") or {}), ensure_ascii=True),
+                        now, now,
+                    ),
+                )
+        return counts
+
+    def upsert_vessel_position(self, value: Mapping[str, Any],
+                               ingestion_run_id: Optional[int] = None) -> Dict[str, Any]:
+        """Persist an actual timestamped position supplied by a configured provider."""
+        item = dict(value)
+        required = ("position_key", "vessel_id", "observed_at", "latitude", "longitude", "source")
+        if any(item.get(key) in (None, "") for key in required):
+            raise ValueError("position_key, vessel_id, observed_at, latitude, longitude, and source are required")
+        latitude, longitude = float(item["latitude"]), float(item["longitude"])
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            raise ValueError("vessel position coordinates are out of range")
+        kind = str(item.get("position_kind") or "historical")
+        if kind not in {"live", "recent", "historical"}:
+            raise ValueError("invalid vessel position_kind")
+        now = utc_now()
+        columns = (
+            "position_key", "vessel_id", "observed_at", "timestamp_state", "latitude",
+            "longitude", "speed_kn", "course_deg", "navigation_state", "destination",
+            "position_kind", "source", "evidence_state", "raw_json", "metadata_json",
+            "ingestion_run_id",
+        )
+        item.update({
+            "latitude": latitude,
+            "longitude": longitude,
+            "timestamp_state": str(item.get("timestamp_state") or "normalized_utc"),
+            "position_kind": kind,
+            "evidence_state": str(item.get("evidence_state") or "source_reported"),
+            "raw_json": json.dumps(json_safe(item.get("raw") or {}), ensure_ascii=True),
+            "metadata_json": json.dumps(json_safe(item.get("metadata") or {}), ensure_ascii=True),
+            "ingestion_run_id": ingestion_run_id,
+        })
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT id FROM vessel_positions WHERE position_key=?", (item["position_key"],),
+            ).fetchone()
+            connection.execute(
+                f"""INSERT INTO vessel_positions
+                    ({','.join(columns)},created_at,updated_at)
+                    VALUES ({','.join('?' for _ in columns)},?,?)
+                    ON CONFLICT(position_key) DO UPDATE SET
+                      observed_at=excluded.observed_at,timestamp_state=excluded.timestamp_state,
+                      latitude=excluded.latitude,longitude=excluded.longitude,
+                      speed_kn=excluded.speed_kn,course_deg=excluded.course_deg,
+                      navigation_state=excluded.navigation_state,destination=excluded.destination,
+                      position_kind=excluded.position_kind,source=excluded.source,
+                      evidence_state=excluded.evidence_state,raw_json=excluded.raw_json,
+                      metadata_json=excluded.metadata_json,ingestion_run_id=excluded.ingestion_run_id,
+                      updated_at=excluded.updated_at""",
+                [item.get(column) for column in columns] + [now, now],
+            )
+            row = connection.execute(
+                "SELECT * FROM vessel_positions WHERE position_key=?", (item["position_key"],),
+            ).fetchone()
+        output = self._record(row)
+        output["action"] = "updated" if existing else "inserted"
+        return output
+
+    def vessels(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        filters = dict(filters or {})
+        where, params = [], []
+        if filters.get("active") not in (None, "", "all"):
+            where.append("active=?")
+            params.append(1 if str(filters["active"]).lower() in {"1", "true", "yes"} else 0)
+        if filters.get("fleet_group") not in (None, "", "all"):
+            where.append("fleet_group=?")
+            params.append(filters["fleet_group"])
+        if filters.get("q"):
+            where.append("(name LIKE ? OR imo LIKE ? OR mmsi LIKE ? OR fleet_group LIKE ?)")
+            params.extend([f"%{filters['q']}%"] * 4)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        limit, offset = _limit(filters.get("limit"), 100), _offset(filters.get("offset"))
+        with self._reader() as connection:
+            total = connection.execute(f"SELECT COUNT(*) FROM vessels{clause}", params).fetchone()[0]
+            rows = connection.execute(
+                f"SELECT * FROM vessels{clause} ORDER BY active DESC,name LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            ).fetchall()
+            items = []
+            for raw in rows:
+                vessel = self._record(raw)
+                call = connection.execute(
+                    """SELECT * FROM vessel_port_calls WHERE vessel_id=?
+                       ORDER BY COALESCE(arrived_at,departed_at,berthed_at) DESC,id DESC LIMIT 1""",
+                    (vessel["vessel_id"],),
+                ).fetchone()
+                position = connection.execute(
+                    """SELECT * FROM vessel_positions WHERE vessel_id=?
+                       ORDER BY observed_at DESC,id DESC LIMIT 1""",
+                    (vessel["vessel_id"],),
+                ).fetchone()
+                vessel["port_call_count"] = connection.execute(
+                    "SELECT COUNT(*) FROM vessel_port_calls WHERE vessel_id=?",
+                    (vessel["vessel_id"],),
+                ).fetchone()[0]
+                vessel["position_count"] = connection.execute(
+                    "SELECT COUNT(*) FROM vessel_positions WHERE vessel_id=?",
+                    (vessel["vessel_id"],),
+                ).fetchone()[0]
+                vessel["last_port_call"] = self._record(call)
+                vessel["last_position"] = self._record(position)
+                items.append(vessel)
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    def vessel_port_calls(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        filters = dict(filters or {})
+        where, params = [], []
+        for field in ("vessel_id", "source", "locode", "operation_signal"):
+            if filters.get(field) not in (None, "", "all"):
+                where.append(f"c.{field}=?")
+                params.append(filters[field])
+        if filters.get("start"):
+            where.append("COALESCE(c.arrived_at,c.departed_at,c.berthed_at)>=?")
+            params.append(str(filters["start"]))
+        if filters.get("end"):
+            where.append("COALESCE(c.arrived_at,c.departed_at,c.berthed_at)<=?")
+            params.append(str(filters["end"]))
+        if filters.get("q"):
+            where.append("(v.name LIKE ? OR c.port_name LIKE ? OR c.locode LIKE ? OR c.next_destination LIKE ?)")
+            params.extend([f"%{filters['q']}%"] * 4)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        limit, offset = _limit(filters.get("limit"), 500), _offset(filters.get("offset"))
+        base = " FROM vessel_port_calls c JOIN vessels v ON v.vessel_id=c.vessel_id"
+        with self._reader() as connection:
+            total = connection.execute(f"SELECT COUNT(*){base}{clause}", params).fetchone()[0]
+            rows = connection.execute(
+                f"""SELECT c.*,v.name vessel_name,v.imo,v.mmsi,v.fleet_group{base}{clause}
+                    ORDER BY COALESCE(c.arrived_at,c.departed_at,c.berthed_at) DESC,c.id DESC
+                    LIMIT ? OFFSET ?""",
+                params + [limit, offset],
+            ).fetchall()
+        return {"items": [self._record(row) for row in rows], "total": total,
+                "limit": limit, "offset": offset}
+
+    def vessel_positions(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        filters = dict(filters or {})
+        where, params = [], []
+        if filters.get("vessel_id"):
+            where.append("p.vessel_id=?")
+            params.append(filters["vessel_id"])
+        if filters.get("position_kind") not in (None, "", "all"):
+            where.append("p.position_kind=?")
+            params.append(filters["position_kind"])
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        limit, offset = _limit(filters.get("limit"), 500), _offset(filters.get("offset"))
+        base = " FROM vessel_positions p JOIN vessels v ON v.vessel_id=p.vessel_id"
+        with self._reader() as connection:
+            total = connection.execute(f"SELECT COUNT(*){base}{clause}", params).fetchone()[0]
+            rows = connection.execute(
+                f"""SELECT p.*,v.name vessel_name,v.imo,v.mmsi{base}{clause}
+                    ORDER BY p.observed_at DESC,p.id DESC LIMIT ? OFFSET ?""",
+                params + [limit, offset],
+            ).fetchall()
+        return {"items": [self._record(row) for row in rows], "total": total,
+                "limit": limit, "offset": offset}
+
+    def vessel_source_health(self) -> List[Dict[str, Any]]:
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM vessel_source_health ORDER BY source_name",
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def vessel_intelligence_status(self) -> Dict[str, Any]:
+        with self._reader() as connection:
+            row = connection.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM vessels) vessels,
+                     (SELECT COUNT(*) FROM vessel_port_calls) historical_port_calls,
+                     (SELECT COUNT(*) FROM vessel_positions) positions,
+                     (SELECT COUNT(*) FROM vessel_positions WHERE position_kind='live') live_positions,
+                     (SELECT MAX(COALESCE(arrived_at,departed_at,berthed_at)) FROM vessel_port_calls) latest_port_call_at,
+                     (SELECT MAX(observed_at) FROM vessel_positions) latest_position_at,
+                     (SELECT MAX(updated_at) FROM vessel_source_health) last_source_update_at""",
+            ).fetchone()
+        return json_safe(dict(row))
+
     def start_run(self, source: str, scope: str = "all",
                   metadata: Optional[Mapping[str, Any]] = None,
                   started_at: Optional[str] = None) -> Dict[str, Any]:
@@ -1388,6 +1999,8 @@ class LpgStore:
             "catalog": {"total": sum(states.values()), "states": states},
             "candidates": {"total": sum(candidate_states.values()), "states": candidate_states},
             "datasets": self.dataset_health(),
+            "intelligence": self.intelligence_status(),
+            "vessel_intelligence": self.vessel_intelligence_status(),
             "sources": sources,
             "news_sources": self.news_source_health(),
             "runs": self.recent_runs(20),

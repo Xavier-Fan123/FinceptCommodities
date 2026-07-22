@@ -413,6 +413,13 @@ class LpgRefreshWorkflow:
             except Exception as exc:
                 counts["rows_skipped"] += 1
                 errors.append(f"news_record: {exc}")
+        try:
+            intelligence = self.service.refresh_intelligence()
+            if intelligence.get("status") in {"partial", "failed"}:
+                warnings.append("situation_intelligence_partial")
+        except Exception as exc:  # noqa: BLE001 - news remains usable if derived intelligence fails
+            intelligence = {"status": "failed", "errors": [str(exc)]}
+            warnings.append("situation_intelligence_failed")
         wrote = counts["rows_inserted"] + counts["rows_updated"]
         provider_available = any(
             health.get("status") in {"healthy", "empty"} for health in source_health
@@ -435,6 +442,7 @@ class LpgRefreshWorkflow:
         )
         return json_safe({"state": state, "run": finished, "counts": counts,
                           "errors": errors, "warnings": warnings,
+                          "intelligence": intelligence,
                           "source_health": source_health,
                           "clusters": len({row.get("cluster_key") for row in ranked
                                            if row.get("cluster_key")}),

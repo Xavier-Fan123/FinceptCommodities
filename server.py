@@ -702,6 +702,59 @@ class Handler(BaseHTTPRequestHandler):
                     as_of=_query_value(query, "as_of"), window=window,
                 ))
 
+            if path == "/api/lpg/situation":
+                filters = _query_fields(query, (
+                    "event_type", "severity", "region", "confirmation_state",
+                    "asset_id", "route_id", "q", "start", "active",
+                ))
+                end = _query_value(query, "end") or _query_value(query, "as_of")
+                if end:
+                    filters["end"] = end
+                limit = _query_int(query, "limit", default=500, minimum=1, maximum=5000)
+                offset = _query_int(query, "offset", minimum=0, maximum=10_000_000)
+                filters["limit"] = limit
+                if offset is not None:
+                    filters["offset"] = offset
+                return self._json(service.situation(filters))
+
+            if path == "/api/lpg/scenarios":
+                return self._json(service.scenarios())
+
+            if path == "/api/lpg/vessel-intelligence":
+                filters = _query_fields(query, (
+                    "q", "fleet_group", "vessel_id", "source", "operation_signal",
+                    "position_kind", "start", "active",
+                ))
+                end = _query_value(query, "end") or _query_value(query, "as_of")
+                if end:
+                    filters["end"] = end
+                filters["limit"] = _query_int(
+                    query, "limit", default=1000, minimum=1, maximum=5000,
+                )
+                return self._json(service.vessel_intelligence(filters))
+
+            if path == "/api/lpg/vessels":
+                filters = _query_fields(query, ("q", "fleet_group", "active"))
+                filters["limit"] = _query_int(
+                    query, "limit", default=500, minimum=1, maximum=5000,
+                )
+                return self._json(service.list_vessels(filters))
+
+            vessel_prefix = "/api/lpg/vessels/"
+            vessel_calls_suffix = "/port-calls"
+            if path.startswith(vessel_prefix) and path.endswith(vessel_calls_suffix):
+                raw_id = path[len(vessel_prefix):-len(vessel_calls_suffix)].strip("/")
+                if not raw_id or "/" in raw_id:
+                    raise KeyError("unknown LPG vessel route")
+                filters = _query_fields(query, (
+                    "source", "operation_signal", "q", "start", "end",
+                ))
+                filters["vessel_id"] = unquote(raw_id)
+                filters["limit"] = _query_int(
+                    query, "limit", default=500, minimum=1, maximum=5000,
+                )
+                return self._json(service.vessel_port_calls(filters))
+
             if path == "/api/lpg/news":
                 filters = _query_fields(query, (
                     "topic", "product", "region", "source", "direction",
@@ -793,8 +846,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/lpg/export":
                 view = _query_value(query, "view", "cockpit").lower()
                 allowed_views = {
-                    "cockpit", "curves", "history", "moc", "news",
-                    "explorer", "status",
+                    "cockpit", "curves", "history", "moc", "situation", "news",
+                    "explorer", "status", "vessels", "port_calls",
                 }
                 if view not in allowed_views:
                     raise ValueError(f"unsupported LPG export view: {view}")
@@ -804,7 +857,9 @@ class Handler(BaseHTTPRequestHandler):
                 filters = _query_fields(query, (
                     "as_of", "series_id", "dataset", "q", "name", "start",
                     "end", "bate", "topic", "product", "region", "source",
-                    "direction", "importance",
+                    "direction", "importance", "event_type", "severity", "asset_id",
+                    "route_id", "confirmation_state", "active",
+                    "fleet_group", "vessel_id", "operation_signal", "position_kind",
                 ))
                 entitlement = _entitlement_filter(query)
                 if entitlement:
@@ -859,7 +914,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 return self._file("web/index.html")
-            if path in ("/style.css", "/app.js"):
+            if path in ("/style.css", "/app.js", "/situation.css", "/situation.js"):
                 return self._file("web/" + path.lstrip("/"))
             if path in ("/ENERGY.md", "/README.md"):
                 return self._file(path.lstrip("/"))
@@ -908,10 +963,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/api/lpg/refresh":
+        if parsed.path not in {"/api/lpg/refresh", "/api/lpg/scenarios/run"}:
             return self._json({"error": "not found"}, 404)
         try:
             payload = self._read_json_body()
+            if parsed.path == "/api/lpg/scenarios/run":
+                scenario_id = payload.get("scenario_id")
+                if not isinstance(scenario_id, str) or not scenario_id.strip():
+                    raise ValueError("scenario_id must be a non-empty string")
+                inputs = payload.get("inputs", {})
+                if not isinstance(inputs, dict):
+                    raise ValueError("scenario inputs must be an object")
+                service, _workflow, _jobs = _lpg_runtime()
+                return self._json(service.run_scenario(scenario_id.strip(), inputs))
             scope = payload.get("scope", "all")
             if not isinstance(scope, str):
                 raise ValueError("refresh scope must be a string")

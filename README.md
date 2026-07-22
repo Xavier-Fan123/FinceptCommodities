@@ -27,11 +27,15 @@ python -m pip install -r requirements.txt
 
 ## What you get
 
-**LPG Trader Cockpit** — a first-class seven-view workspace for an Asia-focused
+**LPG Trader Cockpit** — a first-class eight-view workspace for an Asia-focused
 LPG trader:
 
 - **Cockpit** — entitled FEI/CP/Mont Belvieu/freight assessments, source
   freshness, FEI-CP, P/B, FEI-MOPJ, and freight-adjusted arb signals.
+- **Situation Map** — durable evidence-backed LPG events on a dependency-free
+  reference map, with named terminals/chokepoints, reference trade corridors,
+  source corroboration, baseline-aware alerts, inferred benchmark exposure,
+  and explicit AIS/terminal/news intelligence gaps.
 - **Curves & Spreads** — forward curves and derived spreads with unit checks.
 - **History & Seasonality** — long history, statistics, monthly returns,
   seasonal bands, BATE selection, and correction counts.
@@ -115,10 +119,10 @@ server.py        stdlib http.server (no Flask) + layered TTL cache
 sources.py       compact fetchers — yfinance (quotes/history/curve) + CFTC (COT)
 energy_chemicals.py  Energy Hub product map + key-less news aggregation
 lpg/             private SQLite store, catalog, analytics, Excel staging,
-                 news adapters, refresh jobs, exports, workflow, and CLI
+                 news/event intelligence, refresh jobs, exports, workflow, and CLI
 analytics/       the tested commodity analytics (term structure, risk,
                  seasonality, positioning, spreads, …), self-contained
-web/             index.html · style.css · app.js (the dashboard UI)
+web/             index.html · style.css · app.js · situation.js/css (dashboard UI)
 scripts/         official Add-in refresh and Windows Task Scheduler helpers
 ENERGY.md        energy-commodities primer (served at /ENERGY.md)
 start.bat        launcher (points at the venv Python)
@@ -139,6 +143,11 @@ API (all JSON, all local):
 /api/lpg/series/{id}/history
 /api/lpg/curves
 /api/lpg/spreads
+/api/lpg/situation[?severity=high][&event_type=shipping_disruption][&region=Middle%20East]
+/api/lpg/scenarios
+/api/lpg/vessel-intelligence[?fleet_group=equinor_reference][&vessel_id=imo-...]
+/api/lpg/vessels
+/api/lpg/vessels/{id}/port-calls
 /api/lpg/news[?q=...][&region=asia][&importance=high][&fresh=1]
 /api/lpg/explorer
 /api/lpg/status
@@ -150,6 +159,13 @@ API (all JSON, all local):
 scopes are `asia`, `overnight`, `news`, and `all`; the isolated dataset scopes
 are `history`, `curves`, and `moc`. A second refresh receives HTTP 409 with the
 active job rather than starting another Excel instance.
+
+`POST /api/lpg/scenarios/run` evaluates one of the six bounded LPG stress
+templates (`hormuz_closure`, `panama_disruption`, `red_sea_avoidance`,
+`saudi_loading_reduction`, `usgc_export_outage`, or
+`north_asia_demand_surge`). Inputs and the stress-index formula are returned
+with every result. The index is a relative assumption aid: it is not a
+probability, price, freight, cargo-flow, VaR, or P&L forecast.
 
 ## Licensed LPG setup
 
@@ -237,6 +253,42 @@ than burst concurrently to respect its public service rate guidance. Public
 feeds have no production SLA and never masquerade as licensed Platts content.
 Set `LPG_NEWS_FEEDS_JSON` only for additional RSS/Atom feeds you are permitted
 to ingest.
+
+Every successful News refresh also rebuilds the durable `intelligence_events`
+layer. Events inherit only entitled-to-display local news evidence. Named
+locations are matched conservatively against a curated LPG asset registry;
+unresolved events stay off-map. Route and benchmark exposure is explicitly
+labelled as inferred context, not an official assessment. The built-in map has
+no external tile or JavaScript dependency, and reference corridors never
+masquerade as live vessel tracks. Satellite AIS and authoritative terminal
+operating status remain visible intelligence gaps until separately entitled
+feeds are configured.
+
+The Situation Map includes an interactive Scenario Engine. A scenario uses
+only user-entered duration, shock, and where relevant additional-transit
+assumptions. It highlights exposed reference assets and corridors, links the
+affected benchmarks to currently entitled rows, and surfaces commercial
+questions, calculation components, assumptions, and missing data. It never
+fills an unavailable market row or presents a calculated market outcome.
+
+Vessel Intelligence keeps three capabilities separate: historical port calls,
+continuous AIS tracks, and timestamped current positions. Import a permitted
+CSV snapshot with:
+
+```powershell
+python -m lpg.cli import-vessels C:\path\to\port_calls.csv --fleet-group reference_fleet
+```
+
+The import is keyed and idempotent, records the source-file SHA-256 and source
+health, preserves naive timestamps as `source_timezone_unverified`, and
+recomputes draught-change operation signals as inference. Port-call coordinates
+are displayed as historical triangles and never inserted into
+`vessel_positions`. A marker can be labelled live only when a configured
+provider supplies an explicit timestamped position; the current freshness rule
+is live up to one hour, recent up to 24 hours, and stale thereafter. Snapshot
+access does not establish production API or redistribution entitlement. Raw
+provider evidence stays in the private SQLite audit record; browser/API read
+models expose only normalized fields, provenance, and the evidence hash.
 
 While the local server is running, the persisted LPG news snapshot refreshes in
 the background every two minutes. The visible News tab checks every 60 seconds

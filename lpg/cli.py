@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = sub.add_parser("import", help="import an atomic staging JSON file")
     ingest.add_argument("staging", type=Path)
 
+    vessel_import = sub.add_parser(
+        "import-vessels", help="import a historical vessel port-call CSV snapshot",
+    )
+    vessel_import.add_argument("port_calls", type=Path)
+    vessel_import.add_argument("--fleet-group", default="reference_fleet")
+
     backfill = sub.add_parser("build-backfill", help="build resumable yearly backfill workbooks")
     backfill.add_argument("--start-year", type=int, required=True)
     backfill.add_argument("--end-year", type=int, required=True)
@@ -124,6 +130,10 @@ def main(argv: list[str] | None = None) -> int:
             payload["import"] = service.import_platts_staging(staged)
     elif args.command == "import":
         payload = service.import_platts_staging(args.staging)
+    elif args.command == "import-vessels":
+        payload = service.import_vessel_port_calls(
+            args.port_calls, fleet_group=args.fleet_group,
+        )
     elif args.command == "build-backfill":
         payload = workflow.build_backfill(
             args.start_year, args.end_year, scope=args.scope, symbols=args.symbol,

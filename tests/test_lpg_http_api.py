@@ -132,6 +132,10 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
         for path, key in (
             ("/api/lpg/curves", "curves"),
             ("/api/lpg/spreads", "items"),
+            ("/api/lpg/situation", "events"),
+            ("/api/lpg/scenarios", "templates"),
+            ("/api/lpg/vessel-intelligence", "vessels"),
+            ("/api/lpg/vessels", "items"),
             ("/api/lpg/news", "items"),
             ("/api/lpg/explorer?dataset=observations", "rows"),
             ("/api/lpg/explorer?dataset=moc", "rows"),
@@ -143,8 +147,42 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
                 self.assertIn(key, payload)
         _, _, news = self.json_request("GET", "/api/lpg/news")
         self.assertEqual(["allowed"], [row["article_key"] for row in news["items"]])
+        _, _, situation = self.json_request("GET", "/api/lpg/situation")
+        self.assertEqual(1, situation["total"])
+        self.assertEqual("unavailable", situation["intelligence_gaps"][0]["status"])
         _, _, observations = self.json_request("GET", "/api/lpg/explorer?dataset=observations")
         self.assertEqual(["fei"], [row["series_id"] for row in observations["rows"]])
+
+    def test_scenario_api_and_situation_static_assets(self):
+        status, _, catalog = self.json_request("GET", "/api/lpg/scenarios")
+        self.assertEqual((200, 6, "hypothetical_not_forecast"), (
+            status, len(catalog["templates"]), catalog["state"],
+        ))
+
+        status, _, result = self.json_request("POST", "/api/lpg/scenarios/run", {
+            "scenario_id": "panama_disruption",
+            "inputs": {"shock_pct": 40, "duration_days": 30, "extra_transit_days": 12},
+        })
+        self.assertEqual((200, "panama_disruption", 55), (
+            status, result["scenario_id"], result["stress_index"]["score"],
+        ))
+        self.assertEqual("hypothetical_not_forecast", result["scenario_state"])
+        self.assertIn("usgc_north_asia_cape", result["alternative_route_ids"])
+        self.assertIn("prices", result["market_snapshot"])
+        self.assertIn("does not calculate a price", result["guardrail"])
+
+        status, _, invalid = self.json_request("POST", "/api/lpg/scenarios/run", {
+            "scenario_id": "panama_disruption", "inputs": {"shock_pct": 200},
+        })
+        self.assertEqual(400, status)
+        self.assertIn("between 0 and 100", invalid["error"])
+
+        for path, marker in (("/situation.js", b"FinceptLpgSituation"),
+                             ("/situation.css", b"sit-scenario-lab")):
+            with self.subTest(path=path):
+                status, _, body = self.request("GET", path)
+                self.assertEqual(200, status)
+                self.assertIn(marker, body)
 
     def test_history_curve_provenance_and_dataset_health_contract(self):
         self.service.upsert_observation({
@@ -284,6 +322,14 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn("spreadsheetml", headers["Content-Type"])
         self.assertTrue(body.startswith(b"PK"))
+
+        status, headers, body = self.request(
+            "GET", "/api/lpg/export?view=situation&format=csv",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual('attachment; filename="fincept-lpg-situation.csv"',
+                         headers["Content-Disposition"])
+        self.assertIn(b"Asia LPG fixture", body)
 
     def test_legacy_route_still_works(self):
         status, _, payload = self.json_request("GET", "/api/energy-chemicals")

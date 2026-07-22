@@ -4,14 +4,25 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 from .analytics import calculate_spread, freshness, numeric_statistics, seasonality
 from .catalog import DEFAULT_SPREADS
+from .intelligence import (
+    EVENT_LABELS,
+    INTELLIGENCE_VERSION,
+    asset_catalog,
+    baseline_alerts,
+    build_events,
+    run_scenario as calculate_scenario,
+    route_catalog,
+    scenario_catalog as intelligence_scenario_catalog,
+)
 from .models import json_safe, normalize_date, utc_now
 from .store import LpgStore
+from .vessels import VESSEL_INTELLIGENCE_VERSION, load_port_call_snapshot
 
 
 DERIVED_PROMPT_CURVES = (
@@ -58,6 +69,9 @@ class LpgService:
 
     def upsert_news_source_health(self, value: Mapping[str, Any]) -> Dict[str, Any]:
         return self.store.upsert_news_source_health(value)
+
+    def upsert_intelligence_event(self, value: Mapping[str, Any]) -> Dict[str, Any]:
+        return self.store.upsert_intelligence_event(value)
 
     def start_run(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return self.store.start_run(*args, **kwargs)
@@ -424,6 +438,300 @@ class LpgService:
                 row["latest_freshness"] = latest["freshness"]
         return rows
 
+    def refresh_intelligence(self, limit: int = 5000) -> Dict[str, Any]:
+        """Rebuild durable LPG events from the entitled news evidence of record."""
+        news = self.store.news({"limit": max(1, min(int(limit), 5000)), "offset": 0})
+        events = build_events(news.get("items") or [])
+        counts = {"seen": len(events), "inserted": 0, "updated": 0, "failed": 0}
+        errors = []
+        try:
+            persisted = self.store.upsert_intelligence_events(events)
+            counts["inserted"] = persisted["inserted"]
+            counts["updated"] = persisted["updated"]
+        except Exception as exc:  # noqa: BLE001 - derived-event isolation boundary
+            counts["failed"] = len(events)
+            errors.append(str(exc))
+        return json_safe({
+            "status": "partial" if errors and events else "failed" if errors else "success",
+            "counts": counts,
+            "errors": errors[:20],
+            "version": INTELLIGENCE_VERSION,
+            "updated_at": utc_now(),
+        })
+
+    def situation(self, filters: Optional[Mapping[str, Any]] = None,
+                  **kwargs: Any) -> Dict[str, Any]:
+        """Return the map-first LPG situation and its explicit evidence gaps."""
+        merged = dict(filters or {})
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+        if merged.get("as_of") and not merged.get("end"):
+            merged["end"] = merged.pop("as_of")
+        status = self.store.intelligence_status()
+        sync = None
+        if self.store.intelligence_needs_sync():
+            sync = self.refresh_intelligence()
+            status = self.store.intelligence_status()
+        payload = self.store.intelligence_events(merged)
+        events = payload["items"]
+        for event in events:
+            event["event_type_label"] = EVENT_LABELS.get(
+                str(event.get("event_type")), str(event.get("event_type") or "").replace("_", " ").title(),
+            )
+            confidence = int(event.get("confidence_score") or 0)
+            event["confidence_label"] = "high" if confidence >= 80 else "medium" if confidence >= 55 else "low"
+            event["active"] = bool(event.get("active"))
+        all_events = self.store.intelligence_events({"limit": 5000}).get("items") or []
+        market = self.summary(as_of=merged.get("end"))
+        located = sum(event.get("latitude") is not None and event.get("longitude") is not None
+                      for event in events)
+        confirmed = sum(event.get("confirmation_state") == "confirmed" for event in events)
+        gap_counts: Dict[str, int] = defaultdict(int)
+        for event in events:
+            for gap in event.get("data_gaps") or []:
+                gap_counts[str(gap)] += 1
+        try:
+            from .news_sources import PlattsNewsClient
+            news_api_configured = PlattsNewsClient().configured
+        except Exception:
+            news_api_configured = False
+        intelligence_gaps = [
+            {
+                "id": "satellite_ais",
+                "status": "unavailable",
+                "detail": "No entitled satellite AIS or live vessel-position feed is configured; routes are reference corridors, not live tracks.",
+            },
+            {
+                "id": "terminal_operations",
+                "status": "unavailable",
+                "detail": "No authoritative live terminal operating-status feed is configured; disruption state comes from attributed news evidence.",
+            },
+            {
+                "id": "platts_news",
+                "status": "configured" if news_api_configured else "not_configured",
+                "detail": "Machine-readable Platts News remains a separate entitlement from the Excel Add-in.",
+            },
+        ]
+        return json_safe({
+            **payload,
+            "items": events,
+            "events": events,
+            "assets": asset_catalog(),
+            "routes": route_catalog(),
+            "scenario_engine": intelligence_scenario_catalog(),
+            "vessel_intelligence": self.vessel_intelligence({"compact": True}),
+            "market_snapshot": {
+                "as_of": market.get("as_of"),
+                "prices": market.get("prices") or [],
+                "spreads": market.get("spreads") or [],
+                "errors": market.get("errors") or {},
+            },
+            "coverage": {
+                "total": len(events),
+                "located": located,
+                "unlocated": len(events) - located,
+                "confirmed": confirmed,
+                "developing": len(events) - confirmed,
+                "active": sum(bool(event.get("active")) for event in events),
+                "gap_counts": dict(gap_counts),
+            },
+            "alerting": baseline_alerts(all_events),
+            "intelligence_gaps": intelligence_gaps,
+            "methodology": {
+                "version": INTELLIGENCE_VERSION,
+                "event_source": "entitled rows in the local LPG news store",
+                "geography": "explicit named-location matching only; unresolved events remain unlocated",
+                "route_state": "curated reference corridors; not live AIS tracks",
+                "impact_state": "inferred exposure, never an official price assessment",
+                "corroboration": "official machine-readable evidence or at least two attributed sources",
+            },
+            "persistence": status,
+            "sync": sync,
+            "updated_at": utc_now(),
+        })
+
+    def import_vessel_port_calls(self, path: Any,
+                                 fleet_group: str = "reference_fleet") -> Dict[str, Any]:
+        """Import a historical port-call snapshot with an auditable run record."""
+        snapshot = load_port_call_snapshot(path, fleet_group=fleet_group)
+        run = self.store.start_run(
+            "vessel_snapshot", scope=fleet_group,
+            metadata={
+                "file_name": snapshot["source_file_name"],
+                "sha256": snapshot["source_file_sha256"],
+                "boundary": snapshot["boundary"],
+            },
+        )
+        try:
+            counts = self.store.import_vessel_snapshot(snapshot, ingestion_run_id=run["id"])
+            finished = self.store.finish_run(
+                run["id"], "success",
+                rows_seen=counts["port_calls_seen"],
+                rows_inserted=counts["port_calls_inserted"],
+                rows_updated=counts["port_calls_updated"],
+                rows_skipped=counts["port_calls_unchanged"],
+            )
+        except Exception as exc:
+            self.store.finish_run(run["id"], "failed", error=str(exc))
+            raise
+        return json_safe({
+            "status": "success",
+            "version": VESSEL_INTELLIGENCE_VERSION,
+            "counts": counts,
+            "coverage": snapshot["coverage"],
+            "source_file": snapshot["source_file_name"],
+            "source_file_sha256": snapshot["source_file_sha256"],
+            "source_snapshot_at": snapshot["source_snapshot_at"],
+            "boundary": snapshot["boundary"],
+            "run": finished,
+        })
+
+    @staticmethod
+    def _position_state(position: Mapping[str, Any]) -> Dict[str, Any]:
+        observed = position.get("observed_at")
+        if not observed:
+            return {"freshness": "unknown", "age_hours": None}
+        try:
+            parsed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return {"freshness": "timezone_unverified", "age_hours": None}
+            age = max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 3600)
+        except (TypeError, ValueError):
+            return {"freshness": "timestamp_unverified", "age_hours": None}
+        freshness = "live" if age <= 1 else "recent" if age <= 24 else "stale"
+        return {"freshness": freshness, "age_hours": round(age, 1)}
+
+    @staticmethod
+    def _public_vessel_evidence(value: Mapping[str, Any]) -> Dict[str, Any]:
+        """Keep raw provider evidence private while exposing its audit handle."""
+        output = dict(value)
+        raw = output.pop("raw", None)
+        output["raw_evidence_available"] = raw not in (None, {}, [], "")
+        return json_safe(output)
+
+    def list_vessels(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        payload = self.store.vessels(filters)
+        for vessel in payload["items"]:
+            if vessel.get("last_port_call"):
+                vessel["last_port_call"] = self._public_vessel_evidence(
+                    vessel["last_port_call"],
+                )
+            if vessel.get("last_position"):
+                vessel["last_position"] = self._public_vessel_evidence(
+                    vessel["last_position"],
+                )
+        return json_safe(payload)
+
+    def vessel_port_calls(self, filters: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        payload = self.store.vessel_port_calls(filters)
+        payload["items"] = [self._public_vessel_evidence(item) for item in payload["items"]]
+        return json_safe(payload)
+
+    def vessel_intelligence(self, filters: Optional[Mapping[str, Any]] = None,
+                            **kwargs: Any) -> Dict[str, Any]:
+        """Return vessel context while keeping live and historical evidence separate."""
+        merged = dict(filters or {})
+        merged.update({key: value for key, value in kwargs.items() if value is not None})
+        fleet = self.list_vessels({
+            "q": merged.get("q"), "fleet_group": merged.get("fleet_group"),
+            "active": merged.get("active", True), "limit": merged.get("vessel_limit", 500),
+        })
+        calls = self.vessel_port_calls({
+            "vessel_id": merged.get("vessel_id"), "source": merged.get("source"),
+            "operation_signal": merged.get("operation_signal"), "q": merged.get("q"),
+            "start": merged.get("start"), "end": merged.get("end"),
+            "limit": merged.get("limit", 1000), "offset": merged.get("offset", 0),
+        })
+        positions = self.store.vessel_positions({
+            "vessel_id": merged.get("vessel_id"),
+            "position_kind": merged.get("position_kind"),
+            "limit": merged.get("position_limit", 1000),
+        })
+        positions["items"] = [self._public_vessel_evidence(item) for item in positions["items"]]
+        for position in positions["items"]:
+            position.update(self._position_state(position))
+        if merged.get("compact"):
+            per_vessel: Dict[str, int] = defaultdict(int)
+            compact_calls = []
+            for call in calls["items"]:
+                vessel_id = str(call.get("vessel_id") or "")
+                if per_vessel[vessel_id] >= 12:
+                    continue
+                compact_calls.append(call)
+                per_vessel[vessel_id] += 1
+            calls["items"] = compact_calls
+            latest_positions = {}
+            for position in positions["items"]:
+                latest_positions.setdefault(str(position.get("vessel_id") or ""), position)
+            positions["items"] = list(latest_positions.values())
+        status = self.store.vessel_intelligence_status()
+        live_count = sum(position.get("freshness") == "live" for position in positions["items"])
+        return json_safe({
+            "version": VESSEL_INTELLIGENCE_VERSION,
+            "vessels": fleet["items"],
+            "vessel_total": fleet["total"],
+            "port_calls": calls["items"],
+            "port_call_total": calls["total"],
+            "port_call_returned": len(calls["items"]),
+            "positions": positions["items"],
+            "position_total": positions["total"],
+            "position_returned": len(positions["items"]),
+            "source_health": self.store.vessel_source_health(),
+            "coverage": {
+                **status,
+                "fresh_live_positions": live_count,
+                "display_state": "live_available" if live_count else (
+                    "historical_only" if calls["total"] else "unavailable"
+                ),
+            },
+            "intelligence_gaps": [
+                {
+                    "id": "live_ais",
+                    "status": "configured" if live_count else "unavailable",
+                    "detail": "No fresh timestamped live AIS position is available." if not live_count else
+                              "Fresh provider positions are available and age-labelled.",
+                },
+                {
+                    "id": "continuous_tracks",
+                    "status": "unavailable" if not positions["total"] else "partial",
+                    "detail": "Historical port-call points are not continuous vessel tracks.",
+                },
+                {
+                    "id": "source_entitlement",
+                    "status": "review_required",
+                    "detail": "Snapshot availability does not establish production API or redistribution rights.",
+                },
+            ],
+            "methodology": {
+                "position_rule": "only timestamped vessel_positions may be presented as positions",
+                "port_call_rule": "stopped coordinates remain historical port-call observations",
+                "cargo_rule": "draught change is an inferred operation signal, never cargo proof",
+                "timestamp_rule": "naive source timestamps remain source_timezone_unverified",
+                "freshness_rule": "live <=1h; recent <=24h; older positions stale",
+            },
+            "updated_at": utc_now(),
+        })
+
+    def scenarios(self) -> Dict[str, Any]:
+        """Return the bounded scenario templates without accessing market data."""
+        return intelligence_scenario_catalog()
+
+    def run_scenario(self, scenario_id: str,
+                     inputs: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Evaluate assumptions and attach only entitled current market rows."""
+        result = calculate_scenario(scenario_id, inputs)
+        market = self.summary()
+        result["market_snapshot"] = {
+            "as_of": market.get("as_of"),
+            "prices": market.get("prices") or [],
+            "spreads": market.get("spreads") or [],
+            "errors": market.get("errors") or {},
+        }
+        result["guardrail"] = (
+            "Current entitled rows provide context only; the engine does not calculate a price, "
+            "freight, probability, cargo-flow, or P&L outcome."
+        )
+        return json_safe(result)
+
     def explorer(self, dataset: str = "observations", **filters: Any) -> Dict[str, Any]:
         dataset = str(dataset or "observations").lower()
         as_of = filters.pop("as_of", None)
@@ -474,6 +782,14 @@ class LpgService:
             return self._rows_payload(dataset, rows, filters)
         if dataset == "runs":
             return self._rows_payload(dataset, self.store.recent_runs(200), filters)
+        if dataset in {"events", "intelligence"}:
+            payload = self.store.intelligence_events(filters)
+            rows = payload.get("items") or []
+            return {
+                "dataset": "events", "columns": list(rows[0]) if rows else [], "rows": rows,
+                "total": payload.get("total", len(rows)), "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+            }
         return self.store.explorer(dataset=dataset, **filters)
 
     def status(self) -> Dict[str, Any]:
@@ -692,6 +1008,14 @@ class LpgService:
             if as_of and not filters.get("end"):
                 filters["end"] = as_of
             return self.news(filters)["items"]
+        if view == "situation":
+            if as_of and not filters.get("end"):
+                filters["end"] = as_of
+            return self.situation(filters)["events"]
+        if view in {"vessels", "port_calls"}:
+            if as_of and not filters.get("end"):
+                filters["end"] = as_of
+            return self.vessel_intelligence(filters)["port_calls"]
         if view == "status":
             payload = self.status()
             return [

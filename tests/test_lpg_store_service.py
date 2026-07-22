@@ -541,7 +541,7 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertTrue({"relevance_score", "rank_score", "source_tier",
                          "cluster_key", "is_breaking"}.issubset(columns))
-        self.assertEqual(3, version)
+        self.assertEqual(5, version)
 
 
 if __name__ == "__main__":

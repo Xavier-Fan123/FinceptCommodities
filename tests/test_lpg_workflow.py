@@ -18,6 +18,19 @@ class FakeService:
         self.imported.append(Path(path))
         return {"status": self.import_status, "counts": {"rows_inserted": 1}}
 
+    def curves(self):
+        return {"quality": {
+            "status": "ready",
+            "expected_legs": 6,
+            "available_legs": 6,
+            "latest_common_date": "2026-07-10",
+            "generated_snapshot_count": 2,
+            "missing_latest_legs": [],
+            "duplicate_record_count": 0,
+            "anomaly_count": 0,
+            "reason_codes": [],
+        }}
+
 
 class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
     def setUp(self):
@@ -58,15 +71,32 @@ class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
                 self.assertIn(str(self.script), command)
                 self.assertIn(str(workbook), command)
                 self.assertEqual("60", command[command.index("-TimeoutSec") + 1])
+                self.assertNotIn("-IsolatedInstance", command)
                 self.assertEqual(180, runner.call_args.kwargs["timeout"])
+
+    def test_excel_refresh_can_request_an_isolated_instance(self):
+        workbook = self.scratch / "fixture.xlsx"
+        workbook.write_bytes(b"fixture")
+        runner = Mock(return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok", stderr="",
+        ))
+
+        result = LpgRefreshWorkflow(
+            service=FakeService(), process_runner=runner,
+        )._excel_refresh(workbook, 60, isolated_instance=True)
+
+        self.assertEqual("succeeded", result["state"])
+        self.assertIn("-IsolatedInstance", runner.call_args.args[0])
 
     def test_mocked_process_timeout_is_reported_without_retry(self):
         runner = Mock(side_effect=subprocess.TimeoutExpired(cmd="powershell.exe", timeout=180))
         result = LpgRefreshWorkflow(
             service=FakeService(), process_runner=runner,
         )._excel_refresh(self.scratch / "fixture.xlsx", 60)
-        self.assertEqual({"state": "failed", "returncode": 3,
-                          "reason": "excel_refresh_timeout"}, result)
+        self.assertEqual({
+            "state": "failed", "returncode": 3,
+            "reason": "excel_refresh_timeout", "workbook_updated": False,
+        }, result)
         runner.assert_called_once()
 
     @patch("lpg.workflow.write_runtime_status")
@@ -101,6 +131,12 @@ class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual([staged], service.imported)
         self.assertEqual(["succeeded", "deferred"],
                          [row["state"] for row in result["results"]])
+        self.assertEqual(("ready", 6, "2026-07-10", False), (
+            result["curve_pipeline"]["state"],
+            result["curve_pipeline"]["available_legs"],
+            result["curve_pipeline"]["latest_common_date"],
+            result["curve_pipeline"]["official_fc_requested"],
+        ))
         parse_workbook.assert_called_once_with(asia)
         write_runtime_status.assert_called_once_with(
             scope="overnight", state="deferred", reason_code="excel_already_open",
@@ -133,6 +169,7 @@ class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual("succeeded", result["state"])
         self.assertEqual(1, result["record_count"])
         self.assertEqual([staged], service.imported)
+        self.assertIn("-IsolatedInstance", runner.call_args.args[0])
         build_backfill_workbooks.assert_called_once_with(
             start_year=2025, end_year=2025, scope="asia",
             symbols=("PMAAV00",), batch_size=1, force=False,
@@ -143,6 +180,7 @@ class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
             write_staging.call_args.kwargs,
         )
 
+    @patch("lpg.workflow.OFFICIAL_FC_REFRESH_ENABLED", True)
     @patch("lpg.workflow.write_staging")
     @patch("lpg.workflow.parse_workbook")
     @patch("lpg.workflow.build_curve_workbooks")
@@ -173,6 +211,20 @@ class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
             scope="asia", curve_ids=("CN3HO",), batch_size=1, force=False,
         )
 
+    def test_official_curve_refresh_is_blocked_when_account_has_no_fc_access(self):
+        runner = Mock()
+        result = LpgRefreshWorkflow(
+            service=FakeService(), process_runner=runner,
+        ).refresh_curves(scope="asia", curve_ids=("CN0PT",))
+
+        self.assertEqual(("blocked", False), (
+            result["state"], result["official_refresh_supported"],
+        ))
+        self.assertEqual(
+            "daily_derived_curve_from_current_assessments", result["alternative"],
+        )
+        runner.assert_not_called()
+
     @patch("lpg.workflow.write_staging")
     @patch("lpg.workflow.parse_workbook")
     @patch("lpg.workflow.build_moc_workbooks")
@@ -199,6 +251,43 @@ class WorkflowTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual("platts_ewindow", result["dataset"])
         self.assertEqual("unavailable", result["fundamentals"]["state"])
         self.assertEqual("moc", write_staging.call_args.kwargs["purpose"])
+
+    @patch("lpg.workflow.write_staging")
+    @patch("lpg.workflow.parse_workbook")
+    @patch("lpg.workflow.build_moc_workbooks")
+    def test_updated_valid_empty_moc_workbook_recovers_after_excel_timeout(
+        self, build_moc_workbooks, parse_workbook, write_staging,
+    ):
+        workbook = self.scratch / "Platts_LPG_MOC_asia.xlsx"
+        workbook.write_bytes(b"fixture")
+        staged = self.scratch / "staging" / "moc" / "latest_asia.json"
+        build_moc_workbooks.return_value = [workbook]
+        parse_workbook.return_value = {
+            "schema_version": 1,
+            "scope": "asia",
+            "status": "empty",
+            "records": [],
+            "entitlement_results": [{
+                "candidate_id": "ewindow_asia_asia_lpg",
+                "status": "pending_review",
+                "reason_code": "empty_result",
+            }],
+            "errors": [],
+        }
+        write_staging.return_value = staged
+        workflow = LpgRefreshWorkflow(service=FakeService())
+
+        with patch.object(workflow, "_excel_refresh", return_value={
+            "state": "failed",
+            "returncode": 3,
+            "reason": "excel_refresh_timeout",
+            "workbook_updated": True,
+        }):
+            result = workflow.refresh_moc(scope="asia", timeout_seconds=60)
+
+        self.assertEqual("partial", result["state"])
+        self.assertTrue(result["results"][0]["recovered_saved_workbook"])
+        self.assertEqual("no_data_returned", result["results"][0]["reason"])
 
     def test_generic_refresh_dispatches_specialized_async_scopes(self):
         workflow = LpgRefreshWorkflow(service=FakeService())

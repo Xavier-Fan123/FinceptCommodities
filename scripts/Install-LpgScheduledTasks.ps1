@@ -59,7 +59,7 @@ foreach ($definition in $Definitions) {
     )
     Register-ScheduledTask -TaskName $definition.Name -Action $action -Trigger $triggers `
         -Principal $principal -Settings $settings -Description `
-        'Refresh Fincept LPG data through the signed-in official S&P Global Energy Excel Add-in; later retry triggers skip after daily success.' `
+        'Refresh Fincept LPG data through the signed-in official S&P Global Energy Excel Add-in, accumulate daily derived curves, and audit HM-leg quality; later retry triggers skip after daily success.' `
         -Force | Out-Null
 }
 Write-Output 'INSTALLED Fincept LPG scheduled tasks (08:00 overnight, 17:30 Asia close)'

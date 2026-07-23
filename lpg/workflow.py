@@ -38,6 +38,9 @@ from .service import LpgService
 
 ROOT = Path(__file__).resolve().parents[1]
 REFRESH_SCRIPT = ROOT / "scripts" / "Refresh-LpgPlattsWorkbook.ps1"
+OFFICIAL_FC_REFRESH_ENABLED = str(
+    os.getenv("LPG_PLATTS_FC_REFRESH_ENABLED") or ""
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class LpgRefreshWorkflow:
@@ -56,7 +59,13 @@ class LpgRefreshWorkflow:
             raise ValueError(f"invalid market refresh scope: {scope}")
         return ("asia", "overnight") if scope == "all" else (scope,)
 
-    def _excel_refresh(self, workbook: Path, timeout_seconds: int) -> Dict[str, Any]:
+    def _excel_refresh(
+        self,
+        workbook: Path,
+        timeout_seconds: int,
+        *,
+        isolated_instance: bool = False,
+    ) -> Dict[str, Any]:
         if os.name != "nt":
             return {"state": "failed", "returncode": 3,
                     "reason": "Excel refresh is only available on Windows"}
@@ -69,6 +78,9 @@ class LpgRefreshWorkflow:
             str(REFRESH_SCRIPT), "-Workbook", str(workbook),
             "-TimeoutSec", str(max(60, int(timeout_seconds))),
         ]
+        if isolated_instance:
+            command.append("-IsolatedInstance")
+        workbook_mtime_before = workbook.stat().st_mtime_ns if workbook.exists() else None
         try:
             completed = self.process_runner(
                 command, cwd=str(ROOT), capture_output=True, text=True,
@@ -76,9 +88,20 @@ class LpgRefreshWorkflow:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired:
-            return {"state": "failed", "returncode": 3, "reason": "excel_refresh_timeout"}
+            workbook_mtime_after = workbook.stat().st_mtime_ns if workbook.exists() else None
+            return {
+                "state": "failed",
+                "returncode": 3,
+                "reason": "excel_refresh_timeout",
+                "workbook_updated": (
+                    workbook_mtime_before is not None
+                    and workbook_mtime_after is not None
+                    and workbook_mtime_after > workbook_mtime_before
+                ),
+            }
         output = "\n".join(part.strip() for part in (completed.stdout, completed.stderr)
                            if part and part.strip())[-4000:]
+        workbook_mtime_after = workbook.stat().st_mtime_ns if workbook.exists() else None
         states = {0: "succeeded", 2: "failed", 3: "failed", 4: "deferred"}
         reasons = {0: None, 2: "excel_session_or_formula_unresolved",
                    3: "excel_automation_failed", 4: "excel_already_open"}
@@ -87,7 +110,40 @@ class LpgRefreshWorkflow:
             "returncode": completed.returncode,
             "reason": reasons.get(completed.returncode, "unexpected_excel_exit"),
             "output": output,
+            "workbook_updated": (
+                workbook_mtime_before is not None
+                and workbook_mtime_after is not None
+                and workbook_mtime_after > workbook_mtime_before
+            ),
         }
+
+    def _curve_pipeline_audit(self) -> Dict[str, Any]:
+        """Audit the durable daily HM legs after import without requesting FC data."""
+        try:
+            payload = self.service.curves()
+            quality = dict(payload.get("quality") or {})
+            return json_safe({
+                "state": quality.get("status") or "unknown",
+                "pipeline": "daily_current_refresh",
+                "official_fc_requested": False,
+                "latest_common_date": quality.get("latest_common_date"),
+                "expected_legs": quality.get("expected_legs", 0),
+                "available_legs": quality.get("available_legs", 0),
+                "generated_snapshot_count": quality.get("generated_snapshot_count", 0),
+                "missing_latest_legs": quality.get("missing_latest_legs") or [],
+                "duplicate_record_count": quality.get("duplicate_total_count", 0),
+                "anomaly_count": quality.get("anomaly_count", 0),
+                "reason_codes": quality.get("reason_codes") or [],
+                "quality": quality,
+            })
+        except Exception as exc:
+            return {
+                "state": "error",
+                "pipeline": "daily_current_refresh",
+                "official_fc_requested": False,
+                "reason_codes": ["curve_pipeline_audit_failed"],
+                "error": str(exc)[:1000],
+            }
 
     def refresh_market(self, scope: str = "all", timeout_seconds: int = 240) -> Dict[str, Any]:
         requested = str(scope or "all").lower()
@@ -129,20 +185,30 @@ class LpgRefreshWorkflow:
             return json_safe({"state": "failed", "scope": requested, "results": results,
                               "error": "Refresh returned neither data nor entitlement results"})
         imported = self.service.import_platts_staging(staged)
+        curve_pipeline = (
+            self._curve_pipeline_audit() if requested in {"asia", "all"} else None
+        )
         failed_scopes = [row for row in results if row["state"] != "succeeded"]
         record_count = sum(int(row.get("records") or 0) for row in results)
         if failed_scopes or imported.get("status") == "partial" or record_count == 0:
             state = "partial"
         elif imported.get("status") == "failed":
             state = "failed"
+        elif curve_pipeline and curve_pipeline.get("state") == "error":
+            state = "partial"
         else:
             state = "succeeded"
+        warnings = []
+        if curve_pipeline and curve_pipeline.get("state") in {"warning", "incomplete", "error"}:
+            warnings.extend(curve_pipeline.get("reason_codes") or [])
         return json_safe({
             "state": state,
             "scope": requested,
             "staging": str(staged),
             "results": results,
             "import": imported,
+            "curve_pipeline": curve_pipeline,
+            "warnings": list(dict.fromkeys(warnings)),
             "message": "entitlement_discovery_only" if record_count == 0 else None,
         })
 
@@ -178,7 +244,32 @@ class LpgRefreshWorkflow:
         results: list[dict[str, Any]] = []
         for workbook in workbooks:
             item_scope = self._workbook_scope(workbook)
-            result = self._excel_refresh(workbook, timeout_seconds)
+            result = self._excel_refresh(
+                workbook,
+                timeout_seconds,
+                isolated_instance=True,
+            )
+            payload: dict[str, Any] | None = None
+            if result["state"] != "succeeded" and result.get("workbook_updated"):
+                try:
+                    recovered = parse_workbook(workbook)
+                    recovered_status = str(recovered.get("status") or "").lower()
+                    valid_empty = (
+                        recovered_status in {
+                            "empty", "discovery_only", "success", "partial_success",
+                        }
+                        and bool(recovered.get("entitlement_results") or recovered.get("discovery"))
+                        and not recovered.get("errors")
+                    )
+                    if recovered.get("records") or valid_empty:
+                        payload = recovered
+                        result.update({
+                            "state": "succeeded",
+                            "reason": "saved_workbook_recovered_after_excel_exit",
+                            "recovered_saved_workbook": True,
+                        })
+                except Exception:
+                    pass
             result.update({
                 "scope": item_scope,
                 "workbook": str(workbook),
@@ -196,7 +287,8 @@ class LpgRefreshWorkflow:
                 continue
 
             try:
-                payload = parse_workbook(workbook)
+                if payload is None:
+                    payload = parse_workbook(workbook)
                 result["records"] = len(payload.get("records") or [])
                 result["entitlements"] = len(payload.get("entitlement_results") or [])
                 staged = write_staging(
@@ -293,6 +385,16 @@ class LpgRefreshWorkflow:
         timeout_seconds: int = 240,
         force: bool = False,
     ) -> Dict[str, Any]:
+        if not OFFICIAL_FC_REFRESH_ENABLED:
+            return json_safe({
+                "state": "blocked",
+                "purpose": "curve",
+                "scope": scope,
+                "curve_ids": list(curve_ids or []),
+                "reason": "official_fc_curve_entitlement_not_available",
+                "official_refresh_supported": False,
+                "alternative": "daily_derived_curve_from_current_assessments",
+            })
         workbooks = build_curve_workbooks(
             scope=scope,
             curve_ids=curve_ids,

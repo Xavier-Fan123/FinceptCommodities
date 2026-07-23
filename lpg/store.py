@@ -1653,13 +1653,26 @@ class LpgStore:
         if status not in {"success", "partial", "failed"}:
             raise ValueError(f"invalid final run status: {status}")
         with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT metadata_json FROM ingestion_runs WHERE id=?", (run_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"unknown ingestion run: {run_id}")
+            try:
+                metadata = json.loads(existing["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            extra_metadata = counts.get("metadata")
+            if isinstance(extra_metadata, Mapping):
+                metadata.update(json_safe(dict(extra_metadata)))
             cursor = connection.execute(
                 """UPDATE ingestion_runs SET status=?,finished_at=?,rows_seen=?,rows_inserted=?,
-                   rows_updated=?,rows_skipped=?,error=? WHERE id=?""",
+                   rows_updated=?,rows_skipped=?,error=?,metadata_json=? WHERE id=?""",
                 (
                     status, utc_now(), int(counts.get("rows_seen", 0)),
                     int(counts.get("rows_inserted", 0)), int(counts.get("rows_updated", 0)),
-                    int(counts.get("rows_skipped", 0)), counts.get("error"), run_id,
+                    int(counts.get("rows_skipped", 0)), counts.get("error"),
+                    json.dumps(metadata, ensure_ascii=True), run_id,
                 ),
             )
             if cursor.rowcount == 0:
@@ -1866,6 +1879,14 @@ class LpgStore:
                    FROM dataset_rows
                    WHERE dataset IN ('platts_ewindow','platts_fundamentals')"""
             ).fetchall()
+            news = connection.execute(
+                """SELECT COUNT(*) rows,
+                          COUNT(DISTINCT substr(published_at,1,10)) dates,
+                          COUNT(DISTINCT source) series,
+                          MIN(substr(published_at,1,10)) first_date,
+                          MAX(substr(published_at,1,10)) last_date
+                   FROM news WHERE entitlement_state='entitled'"""
+            ).fetchone()
 
         def metric(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
             raw = dict(row) if row is not None else {}
@@ -1910,6 +1931,13 @@ class LpgStore:
             "reason": None if curve_metric["rows"] else "no_official_curve_points",
         })
 
+        news_metric = metric(news)
+        news_metric.update({
+            "sources": news_metric["series"],
+            "status": "ready" if news_metric["rows"] else "empty",
+            "reason": None if news_metric["rows"] else "no_entitled_news_rows",
+        })
+
         supplemental: Dict[str, Dict[str, Any]] = {
             "platts_ewindow": {"rows": 0, "dates": set(), "series": set()},
             "platts_fundamentals": {"rows": 0, "dates": set(), "series": set()},
@@ -1950,6 +1978,7 @@ class LpgStore:
             "fundamentals": supplemental_metric(
                 "platts_fundamentals", "no_fundamentals_rows",
             ),
+            "news": news_metric,
         })
 
     def status(self) -> Dict[str, Any]:

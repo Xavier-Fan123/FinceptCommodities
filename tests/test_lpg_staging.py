@@ -84,6 +84,26 @@ class StagingImportTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual("entitled", candidate["discovery_status"])
         self.assertEqual("platts_cfr_na_propane", candidate["mapped_series_id"])
 
+    def test_duplicate_workbook_rows_are_idempotent_and_recorded_for_quality(self):
+        payload = self.market_payload()
+        payload["records"].append(dict(payload["records"][0]))
+
+        imported = self.service.import_platts_staging(payload)
+        rows = self.service.store.history("platts_cfr_na_propane")
+
+        self.assertEqual((2, 1, 1), (
+            imported["counts"]["rows_seen"], imported["counts"]["rows_inserted"],
+            imported["counts"]["rows_skipped"],
+        ))
+        self.assertEqual({
+            "rows_unchanged": 1,
+            "duplicate_input_rows": 1,
+            "duplicate_curve_leg_rows": 0,
+        }, imported["input_quality"])
+        self.assertEqual(1, len(rows))
+        self.assertEqual(1, imported["run"]["metadata"]["duplicate_input_rows"])
+        self.assertEqual("daily", imported["run"]["metadata"]["purpose"])
+
     def test_successful_variant_wins_over_stale_variant_error(self):
         payload = self.market_payload()
         payload["entitlement_results"].append({

@@ -2,10 +2,12 @@
 
 import hashlib
 import json
+import math
 import re
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 from .analytics import calculate_spread, freshness, numeric_statistics, seasonality
@@ -45,6 +47,77 @@ DERIVED_PROMPT_CURVES = (
         ),
     },
 )
+DERIVED_PROMPT_COMPONENT_KEYS = frozenset(
+    canonical_key
+    for spec in DERIVED_PROMPT_CURVES
+    for _, canonical_key in spec["components"]
+)
+
+OFFICIAL_FC_CURVE_ACCESS = "not_entitled"
+
+# Daily-derived curves are quality-controlled, but an anomaly never mutates or
+# drops the licensed source observation.  These conservative thresholds are a
+# review signal for USD/mt LPG assessments; the adaptive MAD threshold keeps a
+# naturally volatile history from being flagged on every move.
+CURVE_ANOMALY_ABS_USD_MT = 50.0
+CURVE_ANOMALY_PCT = 0.08
+CURVE_ANOMALY_MAD_MULTIPLIER = 6.0
+CURVE_ANOMALY_WINDOW = 30
+
+
+# Dataset coverage and refreshability are separate product concepts.  Keep the
+# capability map close to the service response so every client sees the same
+# entitlement boundary and knows which UI action, if any, is real.
+DATASET_CAPABILITIES: Dict[str, Dict[str, Any]] = {
+    "current": {
+        "label": "Current prices", "category": "market_data", "view": "cockpit",
+        "refresh_scope": "all", "refresh_supported": True,
+        "access_mode": "licensed_excel",
+    },
+    "history": {
+        "label": "History", "category": "market_data", "view": "history",
+        "refresh_scope": "history", "refresh_supported": True,
+        "access_mode": "licensed_excel",
+    },
+    "curves": {
+        "label": "Daily-derived curves", "category": "market_data", "view": "curves",
+        "refresh_scope": "all", "refresh_supported": True,
+        "refresh_label": "Refresh daily prices",
+        "access_mode": "derived_from_licensed_daily_assessments",
+        "official_fc_status": OFFICIAL_FC_CURVE_ACCESS,
+        "official_refresh_supported": False,
+    },
+    "moc": {
+        "label": "MOC / eWindow", "category": "market_data", "view": "moc",
+        "refresh_scope": "moc", "refresh_supported": True,
+        "access_mode": "licensed_excel",
+    },
+    "fundamentals": {
+        "label": "Fundamentals", "category": "market_data", "view": "moc",
+        "refresh_scope": None, "refresh_supported": False,
+        "access_mode": "not_configured",
+    },
+    "news": {
+        "label": "LPG news", "category": "intelligence", "view": "news",
+        "refresh_scope": "news", "refresh_supported": True,
+        "access_mode": "public_discovery",
+    },
+    "situation": {
+        "label": "Situation intelligence", "category": "intelligence",
+        "view": "situation", "refresh_scope": "news", "refresh_supported": True,
+        "access_mode": "derived_from_attributed_news",
+    },
+    "vessel_history": {
+        "label": "Vessel history", "category": "shipping", "view": "situation",
+        "refresh_scope": None, "refresh_supported": False,
+        "access_mode": "local_snapshot",
+    },
+    "live_ais": {
+        "label": "Live AIS positions", "category": "shipping", "view": "situation",
+        "refresh_scope": None, "refresh_supported": False,
+        "access_mode": "not_configured",
+    },
+}
 
 
 class LpgService:
@@ -187,28 +260,41 @@ class LpgService:
         derived_curves, derived_diagnostics = self._derived_prompt_curves(
             as_of=as_of, series_id=series_id,
         )
+        quality = self._curve_quality_summary(derived_diagnostics, as_of=as_of)
         curves = [*grouped.values(), *derived_curves]
         effective_as_of = normalize_date(as_of) if as_of else max(
             (curve["as_of_date"] for curve in curves), default=None
         )
         official_count = len(grouped)
         derived_count = len(derived_curves)
-        if official_count:
+        if official_count or derived_count:
             status, reason = "ready", None
-        elif derived_count:
-            status = "derived_only"
-            reason = "official_curve_points_missing_using_derived_prompt_structure"
         else:
             status = "empty"
             reason = "no_official_curve_points_or_complete_hm1_hm2_hm3_assessments"
-        dataset_status = {
-            "status": status,
-            "reason": reason,
-            "rows": sum(len(curve["points"]) for curve in curves),
-            "dates": len({curve["as_of_date"] for curve in curves}),
-            "series": len(curves),
+        dataset_state, dataset_reason = status, reason
+        if status == "ready" and quality.get("status") in {"warning", "incomplete"}:
+            dataset_state = "available_with_warning"
+            dataset_reason = next(iter(quality.get("reason_codes") or []), None)
+        curve_dates = {
+            str(curve_date)
+            for curve in curves
+            for curve_date in (
+                curve.get("available_dates") or
+                ([curve.get("as_of_date")] if curve.get("as_of_date") else [])
+            )
         }
-        runtime = self._specialized_runtime_statuses().get("curves")
+        dataset_status = {
+            "status": dataset_state,
+            "reason": dataset_reason,
+            "rows": sum(len(curve["points"]) for curve in curves),
+            "dates": len(curve_dates),
+            "series": len(curves),
+            "quality_status": quality.get("status"),
+            "quality_reasons": quality.get("reason_codes") or [],
+            "quality": quality,
+        }
+        runtime = self._daily_runtime_status()
         dataset_status = self._with_runtime_status(dataset_status, runtime)
         return json_safe({
             "as_of": effective_as_of,
@@ -224,75 +310,249 @@ class LpgService:
             "derived_curve_count": derived_count,
             "derived_point_count": sum(len(curve["points"]) for curve in derived_curves),
             "derived_diagnostics": derived_diagnostics,
+            "quality": quality,
+            "curve_policy": "daily_derived_from_entitled_assessments",
+            "official_fc_status": OFFICIAL_FC_CURVE_ACCESS,
+            "official_refresh_supported": False,
         })
 
     def _derived_prompt_curves(self, as_of: Optional[str] = None,
                                series_id: Optional[str] = None) -> tuple[list[Dict[str, Any]],
                                                                            list[Dict[str, Any]]]:
-        """Compose clearly-labelled prompt structures from current HM assessments.
+        """Build daily curve snapshots from entitled HM1/HM2/HM3 assessments.
 
-        The components are licensed assessment series already present in the
-        catalog.  They are only combined when all three tenors are entitled,
-        active, share one current assessment date, currency, and unit.  The
-        result must never be represented as an official Platts FC curve.
+        Every snapshot is the intersection of three independently stored daily
+        assessment series. Missing dates are never forward-filled and units are
+        never inferred. The result is a local derived curve, not an official FC
+        dataset, and remains traceable to each source observation.
         """
         curves, diagnostics = [], []
+        quality_reference = date.fromisoformat(normalize_date(as_of)) if as_of else None
         for spec in DERIVED_PROMPT_CURVES:
-            components, missing = [], []
+            source_components, missing, component_health = [], [], []
             for tenor, canonical_key in spec["components"]:
                 series = self.store.get_series_by_canonical_key(canonical_key)
                 if (series is None or series.get("entitlement_state") != "entitled" or
                         not series.get("active")):
                     missing.append(canonical_key)
+                    component_health.append({
+                        "tenor": tenor,
+                        "canonical_key": canonical_key,
+                        "series_id": series.get("id") if series else None,
+                        "status": "missing",
+                        "reason": "missing_or_unentitled_component",
+                        "observation_count": 0,
+                        "first_date": None,
+                        "last_date": None,
+                        "freshness": {"status": "missing", "business_days": None},
+                        "duplicate_record_count": 0,
+                        "anomaly_count": 0,
+                        "anomalies": [],
+                    })
                     continue
-                records = self.store.history(series["id"], end=as_of, limit=1)
+                raw_records = self.store.history(series["id"], end=as_of)
+                records, duplicates = self._curve_records_by_date(raw_records)
                 if not records:
                     missing.append(canonical_key)
+                    component_health.append({
+                        "tenor": tenor,
+                        "canonical_key": canonical_key,
+                        "series_id": series["id"],
+                        "status": "missing",
+                        "reason": "no_daily_assessments",
+                        "observation_count": 0,
+                        "first_date": None,
+                        "last_date": None,
+                        "freshness": {"status": "missing", "business_days": None},
+                        "duplicate_record_count": len(duplicates),
+                        "anomaly_count": 0,
+                        "anomalies": [],
+                    })
                     continue
-                components.append({"tenor": tenor, "series": series, "record": records[0]})
+                record_dates = sorted(records)
+                anomalies = self._curve_leg_anomalies(records)
+                component_freshness = freshness(record_dates[-1], quality_reference)
+                component_health.append({
+                    "tenor": tenor,
+                    "canonical_key": canonical_key,
+                    "series_id": series["id"],
+                    "status": (
+                        "warning" if duplicates or anomalies or
+                        component_freshness.get("status") in {"delayed", "stale"}
+                        else "ready"
+                    ),
+                    "reason": (
+                        "duplicate_curve_input_records" if duplicates
+                        else "abnormal_daily_jump_detected" if anomalies
+                        else f"curve_component_{component_freshness.get('status')}"
+                        if component_freshness.get("status") in {"delayed", "stale"}
+                        else None
+                    ),
+                    "observation_count": len(records),
+                    "first_date": record_dates[0],
+                    "last_date": record_dates[-1],
+                    "latest_value": records[record_dates[-1]].get("value"),
+                    "freshness": component_freshness,
+                    "duplicate_record_count": len(duplicates),
+                    "duplicate_records": duplicates[-10:],
+                    "anomaly_count": len(anomalies),
+                    "anomalies": anomalies[-10:],
+                })
+                source_components.append({
+                    "tenor": tenor,
+                    "series": series,
+                    "records": records,
+                })
 
-            component_ids = [component["series"]["id"] for component in components]
+            component_ids = [component["series"]["id"] for component in source_components]
             if series_id and series_id not in component_ids and series_id != spec["canonical_key"]:
                 continue
+            all_dates = sorted({
+                curve_date
+                for component in source_components
+                for curve_date in component["records"]
+            })
+            latest_observed_date = all_dates[-1] if all_dates else None
+            duplicate_count = sum(
+                int(component.get("duplicate_record_count") or 0)
+                for component in component_health
+            )
+            anomalies = [
+                {"canonical_key": component["canonical_key"],
+                 "tenor": component["tenor"], **anomaly}
+                for component in component_health
+                for anomaly in component.get("anomalies") or []
+            ]
             diagnostic: Dict[str, Any] = {
                 "canonical_key": spec["canonical_key"],
+                "name": spec["name"],
+                "expected_components": [key for _, key in spec["components"]],
                 "component_series_ids": component_ids,
+                "components": component_health,
+                "expected_component_count": len(spec["components"]),
+                "available_component_count": len(source_components),
                 "missing_components": missing,
+                "latest_observed_date": latest_observed_date,
+                "duplicate_record_count": duplicate_count,
+                "anomaly_count": len(anomalies),
+                "anomalies": anomalies[-20:],
             }
-            if missing or len(components) != len(spec["components"]):
-                diagnostic.update({"status": "incomplete", "reason": "missing_or_unentitled_component"})
-                diagnostics.append(diagnostic)
-                continue
-
-            dates = {component["record"]["date"] for component in components}
-            currencies = {component["record"].get("currency") for component in components}
-            units = {component["record"].get("unit") for component in components}
-            if len(dates) != 1:
+            if missing or len(source_components) != len(spec["components"]):
                 diagnostic.update({
-                    "status": "incomplete", "reason": "component_dates_do_not_match",
-                    "component_dates": sorted(dates),
+                    "status": "incomplete",
+                    "reason": "missing_or_unentitled_component",
+                    "reason_codes": ["missing_or_unentitled_component"],
+                    "available_dates": [],
+                    "snapshot_count": 0,
+                    "incomplete_date_count": len(all_dates),
+                    "incomplete_dates": [
+                        {
+                            "date": curve_date,
+                            "missing_components": [
+                                key for _, key in spec["components"]
+                                if key in missing or not any(
+                                    component["series"].get("canonical_key") == key
+                                    and curve_date in component["records"]
+                                    for component in source_components
+                                )
+                            ],
+                        }
+                        for curve_date in all_dates[-30:]
+                    ],
                 })
                 diagnostics.append(diagnostic)
                 continue
-            if len(currencies) != 1 or len(units) != 1:
+
+            common_dates = set(source_components[0]["records"])
+            for component in source_components[1:]:
+                common_dates &= set(component["records"])
+            incomplete_dates = []
+            for curve_date in all_dates:
+                absent = [
+                    component["series"].get("canonical_key")
+                    for component in source_components
+                    if curve_date not in component["records"]
+                ]
+                if absent:
+                    incomplete_dates.append({
+                        "date": curve_date,
+                        "missing_components": absent,
+                    })
+
+            snapshots = []
+            rejected_dates: list[Dict[str, Any]] = []
+            for curve_date in sorted(common_dates):
+                records = [component["records"][curve_date] for component in source_components]
+                currencies = {record.get("currency") for record in records}
+                units = {record.get("unit") for record in records}
+                if (len(currencies) != 1 or len(units) != 1 or
+                        None in currencies or None in units):
+                    rejected_dates.append({
+                        "date": curve_date,
+                        "reason": "currency_or_unit_mismatch",
+                        "currencies": sorted(str(value) for value in currencies),
+                        "units": sorted(str(value) for value in units),
+                    })
+                    continue
+                values = {
+                    component["tenor"]: record["value"]
+                    for component, record in zip(source_components, records)
+                }
+                try:
+                    numeric_values = [float(values[tenor]) for tenor, _ in spec["components"]]
+                except (TypeError, ValueError):
+                    rejected_dates.append({
+                        "date": curve_date,
+                        "reason": "non_numeric_curve_value",
+                    })
+                    continue
+                if not all(math.isfinite(value) for value in numeric_values):
+                    rejected_dates.append({
+                        "date": curve_date,
+                        "reason": "non_finite_curve_value",
+                    })
+                    continue
+                snapshots.append({
+                    "as_of_date": curve_date,
+                    "values": values,
+                    "currency": next(iter(currencies)),
+                    "unit": next(iter(units)),
+                    **self._daily_curve_shape(numeric_values),
+                })
+
+            if not snapshots:
                 diagnostic.update({
-                    "status": "incomplete", "reason": "component_units_do_not_match",
-                    "component_currencies": sorted(str(value) for value in currencies),
-                    "component_units": sorted(str(value) for value in units),
+                    "status": "incomplete",
+                    "reason": "no_complete_same_date_unit_aligned_snapshot",
+                    "reason_codes": ["no_complete_same_date_unit_aligned_snapshot"],
+                    "rejected_dates": rejected_dates,
+                    "available_dates": [],
+                    "snapshot_count": 0,
+                    "incomplete_date_count": len(incomplete_dates),
+                    "incomplete_dates": incomplete_dates[-30:],
                 })
                 diagnostics.append(diagnostic)
                 continue
 
-            curve_date = next(iter(dates))
-            primary_series = components[0]["series"]
+            selected = snapshots[-1]
+            previous = snapshots[-2] if len(snapshots) > 1 else None
+            curve_date = selected["as_of_date"]
+            primary_series = source_components[0]["series"]
             points = []
-            for component in components:
-                record, source_series = component["record"], component["series"]
+            front_value = float(selected["values"][source_components[0]["tenor"]])
+            for component in source_components:
+                tenor, source_series = component["tenor"], component["series"]
+                record = component["records"][curve_date]
+                value = float(record["value"])
+                prior_value = (
+                    float(previous["values"][tenor])
+                    if previous and tenor in previous["values"] else None
+                )
                 points.append({
                     "id": f"derived:{record['id']}",
                     "as_of_date": curve_date,
-                    "contract_month": component["tenor"],
-                    "tenor": component["tenor"],
+                    "contract_month": tenor,
+                    "tenor": tenor,
                     "delivery_start": None,
                     "delivery_end": None,
                     "value": record["value"],
@@ -305,10 +565,49 @@ class LpgService:
                     "entitlement_state": "entitled",
                     "freshness": freshness(curve_date),
                     "derived": True,
-                    "curve_kind": "derived_prompt_structure",
+                    "curve_kind": "daily_derived_assessment_curve",
                     "source_series_id": source_series["id"],
                     "source_canonical_key": source_series.get("canonical_key"),
+                    "day_change": round(value - prior_value, 6) if prior_value is not None else None,
+                    "front_minus_tenor": round(front_value - value, 6),
                 })
+            latest_complete_date = selected["as_of_date"]
+            latest_missing_components = [
+                component["series"].get("canonical_key")
+                for component in source_components
+                if latest_observed_date and latest_observed_date not in component["records"]
+            ]
+            curve_freshness = freshness(latest_complete_date, quality_reference)
+            reason_codes: list[str] = []
+            if incomplete_dates:
+                reason_codes.append("incomplete_curve_dates_detected")
+            if latest_observed_date and latest_observed_date > latest_complete_date:
+                reason_codes.append("latest_curve_date_incomplete")
+            if duplicate_count:
+                reason_codes.append("duplicate_curve_input_records")
+            if rejected_dates:
+                reason_codes.append("curve_unit_or_currency_mismatch")
+            if anomalies:
+                reason_codes.append("abnormal_daily_jump_detected")
+            if curve_freshness.get("status") == "delayed":
+                reason_codes.append("curve_pipeline_delayed")
+            elif curve_freshness.get("status") == "stale":
+                reason_codes.append("curve_pipeline_stale")
+            quality_status = "warning" if reason_codes else "ready"
+            curve_quality = {
+                "status": quality_status,
+                "reason_codes": reason_codes,
+                "latest_observed_date": latest_observed_date,
+                "latest_complete_date": latest_complete_date,
+                "freshness": curve_freshness,
+                "expected_components": len(spec["components"]),
+                "available_components": len(source_components),
+                "missing_latest_components": latest_missing_components,
+                "incomplete_date_count": len(incomplete_dates),
+                "duplicate_record_count": duplicate_count,
+                "anomaly_count": len(anomalies),
+                "rejected_date_count": len(rejected_dates),
+            }
             curves.append({
                 # Use an entitled component as the access-control anchor so
                 # the existing UI catalog filter can validate and display it.
@@ -318,21 +617,296 @@ class LpgService:
                 "source": "derived_from_current_assessments",
                 "entitlement_state": "entitled",
                 "as_of_date": curve_date,
-                "currency": next(iter(currencies)),
-                "unit": next(iter(units)),
-                "curve_kind": "derived_prompt_structure",
+                "currency": selected["currency"],
+                "unit": selected["unit"],
+                "curve_kind": "daily_derived_assessment_curve",
+                "legacy_curve_kind": "derived_prompt_structure",
                 "derived": True,
                 "is_official": False,
                 "component_series_ids": component_ids,
+                "derivation_frequency": "daily",
+                "methodology_version": "daily_hm_snapshot_v2_quality",
+                "available_dates": [snapshot["as_of_date"] for snapshot in snapshots],
+                "history_count": len(snapshots),
+                "history": snapshots[-120:],
+                "quality": curve_quality,
+                "shape": {
+                    key: selected[key] for key in (
+                        "structure", "hm1_hm2", "hm2_hm3", "hm1_hm3",
+                        "slope_per_half_month",
+                    )
+                },
                 "methodology": (
-                    "Composed from entitled HM1/HM2/HM3 current assessments; "
-                    "not an official Platts FC curve."
+                    "Rebuilt for each common assessment date from entitled "
+                    "HM1/HM2/HM3 daily Current-Symbol observations; no forward-fill "
+                    "or interpolation; not an official Platts FC curve."
                 ),
                 "points": points,
             })
-            diagnostic.update({"status": "ready", "reason": None, "as_of_date": curve_date})
+            diagnostic.update({
+                "status": quality_status,
+                "reason": reason_codes[0] if reason_codes else None,
+                "reason_codes": reason_codes,
+                "as_of_date": curve_date,
+                "first_date": snapshots[0]["as_of_date"],
+                "last_date": curve_date,
+                "available_dates": [snapshot["as_of_date"] for snapshot in snapshots],
+                "snapshot_count": len(snapshots),
+                "rejected_dates": rejected_dates,
+                "incomplete_date_count": len(incomplete_dates),
+                "incomplete_dates": incomplete_dates[-30:],
+                "missing_latest_components": latest_missing_components,
+                "freshness": curve_freshness,
+            })
             diagnostics.append(diagnostic)
         return curves, diagnostics
+
+    @staticmethod
+    def _curve_records_by_date(
+        records: Sequence[Mapping[str, Any]],
+    ) -> tuple[Dict[str, Dict[str, Any]], list[Dict[str, Any]]]:
+        """Index one effective daily leg and surface duplicates instead of hiding them."""
+        indexed: Dict[str, Dict[str, Any]] = {}
+        duplicates: list[Dict[str, Any]] = []
+        for raw in records:
+            curve_date = str(raw.get("date") or raw.get("observation_date") or "").strip()
+            if not curve_date:
+                continue
+            record = dict(raw)
+            current = indexed.get(curve_date)
+            if current is not None:
+                duplicates.append({
+                    "date": curve_date,
+                    "kept_id": current.get("id"),
+                    "duplicate_id": record.get("id"),
+                })
+                current_rank = (
+                    str(current.get("publication_time") or ""),
+                    str(current.get("fetched_at") or ""),
+                    int(current.get("id") or 0),
+                )
+                incoming_rank = (
+                    str(record.get("publication_time") or ""),
+                    str(record.get("fetched_at") or ""),
+                    int(record.get("id") or 0),
+                )
+                if incoming_rank >= current_rank:
+                    indexed[curve_date] = record
+            else:
+                indexed[curve_date] = record
+        return indexed, duplicates
+
+    @staticmethod
+    def _curve_leg_anomalies(
+        records: Mapping[str, Mapping[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        ordered: list[tuple[str, float]] = []
+        for curve_date in sorted(records):
+            try:
+                value = float(records[curve_date].get("value"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                ordered.append((curve_date, value))
+        changes = []
+        for (prior_date, prior), (curve_date, value) in zip(ordered, ordered[1:]):
+            delta = value - prior
+            pct = abs(delta / prior) if prior else None
+            changes.append({
+                "date": curve_date,
+                "prior_date": prior_date,
+                "value": value,
+                "prior_value": prior,
+                "change": delta,
+                "pct_change": pct,
+            })
+        recent = changes[-CURVE_ANOMALY_WINDOW:]
+        absolute_changes = [abs(item["change"]) for item in recent]
+        adaptive_threshold = CURVE_ANOMALY_ABS_USD_MT
+        if len(absolute_changes) >= 5:
+            center = median(absolute_changes)
+            mad = median(abs(value - center) for value in absolute_changes)
+            adaptive_threshold = max(
+                CURVE_ANOMALY_ABS_USD_MT,
+                center + CURVE_ANOMALY_MAD_MULTIPLIER * max(mad, 0.5),
+            )
+        anomalies = []
+        for item in recent:
+            reasons = []
+            if abs(item["change"]) >= adaptive_threshold:
+                reasons.append("absolute_or_robust_threshold")
+            if item["pct_change"] is not None and item["pct_change"] >= CURVE_ANOMALY_PCT:
+                reasons.append("percentage_threshold")
+            if not reasons:
+                continue
+            anomalies.append({
+                "date": item["date"],
+                "prior_date": item["prior_date"],
+                "value": round(item["value"], 6),
+                "prior_value": round(item["prior_value"], 6),
+                "change": round(item["change"], 6),
+                "pct_change": round(item["pct_change"] * 100, 4)
+                if item["pct_change"] is not None else None,
+                "absolute_threshold": round(adaptive_threshold, 6),
+                "percentage_threshold": CURVE_ANOMALY_PCT * 100,
+                "reasons": reasons,
+            })
+        return anomalies
+
+    def _curve_quality_summary(
+        self,
+        diagnostics: Sequence[Mapping[str, Any]],
+        *,
+        as_of: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not diagnostics:
+            return {
+                "status": "not_applicable",
+                "reason_codes": [],
+                "pipeline": "daily_current_refresh",
+            }
+        components = [
+            {"curve_key": diagnostic.get("canonical_key"), **dict(component)}
+            for diagnostic in diagnostics
+            for component in diagnostic.get("components") or []
+        ]
+        expected_legs = sum(int(row.get("expected_component_count") or 0)
+                            for row in diagnostics)
+        available_legs = sum(
+            1 for component in components if component.get("last_date")
+        )
+        latest_observed_date = max(
+            (str(component["last_date"]) for component in components
+             if component.get("last_date")),
+            default=None,
+        )
+        missing_latest_legs = [
+            str(component.get("canonical_key"))
+            for component in components
+            if latest_observed_date and component.get("last_date") != latest_observed_date
+        ]
+        complete_date_sets = [
+            set(str(value) for value in diagnostic.get("available_dates") or [])
+            for diagnostic in diagnostics
+        ]
+        common_dates = set.intersection(*complete_date_sets) if complete_date_sets else set()
+        latest_common_date = max(common_dates, default=None)
+        quality_reference = date.fromisoformat(normalize_date(as_of)) if as_of else None
+        common_freshness = freshness(latest_common_date, quality_reference)
+        reason_codes: list[str] = []
+        for diagnostic in diagnostics:
+            for reason in diagnostic.get("reason_codes") or []:
+                if reason not in reason_codes:
+                    reason_codes.append(str(reason))
+        if available_legs < expected_legs and "missing_or_unentitled_component" not in reason_codes:
+            reason_codes.insert(0, "missing_or_unentitled_component")
+        if missing_latest_legs and "six_leg_latest_date_incomplete" not in reason_codes:
+            reason_codes.insert(0, "six_leg_latest_date_incomplete")
+        if not latest_common_date and "no_complete_six_leg_snapshot" not in reason_codes:
+            reason_codes.insert(0, "no_complete_six_leg_snapshot")
+
+        latest_daily_import = None
+        for run in self.store.recent_runs(50):
+            metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
+            if (run.get("source") == "platts_excel" and
+                    str(metadata.get("purpose") or "").lower() == "daily" and
+                    str(run.get("scope") or "").lower() in {"asia", "all"}):
+                latest_daily_import = {
+                    "run_id": run.get("id"),
+                    "status": run.get("status"),
+                    "finished_at": run.get("finished_at"),
+                    "rows_seen": run.get("rows_seen"),
+                    "rows_inserted": run.get("rows_inserted"),
+                    "rows_updated": run.get("rows_updated"),
+                    "rows_unchanged": int(metadata.get("rows_unchanged") or 0),
+                    "duplicate_input_rows": int(metadata.get("duplicate_input_rows") or 0),
+                    "duplicate_curve_leg_rows": int(
+                        metadata.get("duplicate_curve_leg_rows") or 0
+                    ),
+                }
+                break
+        if (latest_daily_import and latest_daily_import["duplicate_curve_leg_rows"] and
+                "duplicate_daily_refresh_rows" not in reason_codes):
+            reason_codes.append("duplicate_daily_refresh_rows")
+
+        if available_legs < expected_legs or not latest_common_date:
+            quality_status = "incomplete"
+        elif reason_codes:
+            quality_status = "warning"
+        else:
+            quality_status = "ready"
+        anomalies = [
+            {"curve_key": diagnostic.get("canonical_key"), **dict(anomaly)}
+            for diagnostic in diagnostics
+            for anomaly in diagnostic.get("anomalies") or []
+        ]
+        storage_duplicate_count = sum(
+            int(row.get("duplicate_record_count") or 0) for row in diagnostics
+        )
+        import_duplicate_count = int(
+            (latest_daily_import or {}).get("duplicate_curve_leg_rows") or 0
+        )
+        return {
+            "status": quality_status,
+            "reason_codes": reason_codes,
+            "pipeline": "daily_current_refresh",
+            "pipeline_role": "source_of_truth_for_daily_derived_curves",
+            "storage_policy": "persist_source_legs_rebuild_complete_snapshots",
+            "snapshot_policy": "same_date_hm1_hm2_hm3_required_per_curve",
+            "incomplete_policy": "retain_source_observations_skip_curve_snapshot",
+            "expected_legs": expected_legs,
+            "available_legs": available_legs,
+            "complete_curve_count": sum(
+                1 for row in diagnostics if int(row.get("snapshot_count") or 0) > 0
+            ),
+            "expected_curve_count": len(diagnostics),
+            "generated_snapshot_count": sum(
+                int(row.get("snapshot_count") or 0) for row in diagnostics
+            ),
+            "common_six_leg_snapshot_count": len(common_dates),
+            "latest_observed_date": latest_observed_date,
+            "latest_common_date": latest_common_date,
+            "latest_common_freshness": common_freshness,
+            "missing_latest_legs": missing_latest_legs,
+            "incomplete_date_count": sum(
+                int(row.get("incomplete_date_count") or 0) for row in diagnostics
+            ),
+            "rejected_date_count": sum(
+                len(row.get("rejected_dates") or []) for row in diagnostics
+            ),
+            "duplicate_record_count": storage_duplicate_count,
+            "latest_import_duplicate_curve_leg_rows": import_duplicate_count,
+            "duplicate_total_count": storage_duplicate_count + import_duplicate_count,
+            "anomaly_count": len(anomalies),
+            "anomalies": anomalies[-20:],
+            "components": components,
+            "latest_daily_import": latest_daily_import,
+        }
+
+    @staticmethod
+    def _daily_curve_shape(values: Sequence[Any]) -> Dict[str, Any]:
+        numbers = [float(value) for value in values]
+        if len(numbers) != 3:
+            raise ValueError("daily derived curve requires exactly three tenor values")
+        hm1_hm2 = numbers[0] - numbers[1]
+        hm2_hm3 = numbers[1] - numbers[2]
+        hm1_hm3 = numbers[0] - numbers[2]
+        tolerance = max(0.01, max(abs(value) for value in numbers) * 0.000001)
+        if abs(hm1_hm2) <= tolerance and abs(hm2_hm3) <= tolerance:
+            structure = "flat"
+        elif hm1_hm2 > tolerance and hm2_hm3 > tolerance:
+            structure = "backwardation"
+        elif hm1_hm2 < -tolerance and hm2_hm3 < -tolerance:
+            structure = "contango"
+        else:
+            structure = "kinked"
+        return {
+            "structure": structure,
+            "hm1_hm2": round(hm1_hm2, 6),
+            "hm2_hm3": round(hm2_hm3, 6),
+            "hm1_hm3": round(hm1_hm3, 6),
+            "slope_per_half_month": round((numbers[2] - numbers[0]) / 2, 6),
+        }
 
     def spreads(self, as_of: Optional[str] = None, window: int = 252,
                 definitions: Optional[Sequence[Mapping[str, Any]]] = None) -> Dict[str, Any]:
@@ -810,12 +1384,7 @@ class LpgService:
                 "last_success_at": None,
                 "error": None if news_configured else "Machine-readable news API entitlement is not configured",
             })
-        try:
-            from .platts_excel import STAGING_DIR
-            runtime_path = STAGING_DIR / "status.json"
-            runtime = json.loads(runtime_path.read_text(encoding="utf-8")) if runtime_path.exists() else {}
-        except (OSError, json.JSONDecodeError):
-            runtime = {}
+        runtime = self._daily_runtime_status()
         excel = next((source for source in sources if source.get("source") == "platts_excel"), None)
         if excel is None:
             excel = {"source": "platts_excel", "series_count": 0, "entitled_count": 0}
@@ -830,10 +1399,21 @@ class LpgService:
         status["news_sources"] = self._news_source_health()
         status["runtime"] = runtime
         status["news_api_configured"] = news_configured
-        status["entitlement_matrix"] = self.store.candidates()
+        matrix = self.store.candidates()
+        status["entitlement_matrix"] = matrix
         specialized = self._specialized_runtime_statuses()
         status["specialized_runtime"] = specialized
-        status["datasets"] = self._dataset_health(status.get("datasets"), specialized)
+        dataset_runtimes = {
+            name: value for name, value in specialized.items() if name != "curves"
+        }
+        if runtime:
+            dataset_runtimes["current"] = runtime
+            dataset_runtimes["curves"] = runtime
+        coverage = self._dataset_health(status.get("datasets"), dataset_runtimes)
+        status["datasets"] = self._operational_dataset_health(
+            coverage, status=status, news_configured=news_configured, matrix=matrix,
+        )
+        status["availability_summary"] = self._availability_summary(status["datasets"])
         return json_safe(status)
 
     def _dataset_health(self, stored: Optional[Mapping[str, Any]] = None,
@@ -846,10 +1426,17 @@ class LpgService:
         curves = self.curves()
         all_curves = curves["curves"]
         curve_dates = sorted({
-            str(curve["as_of_date"]) for curve in all_curves if curve.get("as_of_date")
+            str(curve_date)
+            for curve in all_curves
+            for curve_date in (
+                curve.get("available_dates") or
+                ([curve.get("as_of_date")] if curve.get("as_of_date") else [])
+            )
         })
         official = [curve for curve in all_curves if curve.get("is_official")]
         derived = [curve for curve in all_curves if curve.get("derived")]
+        quality = dict(curves.get("quality") or {})
+        endpoint_status = dict(curves.get("dataset_status") or {})
         datasets["curves"] = {
             "rows": sum(len(curve.get("points") or []) for curve in all_curves),
             "dates": len(curve_dates),
@@ -860,14 +1447,239 @@ class LpgService:
             "official_series": len(official),
             "derived_rows": sum(len(curve.get("points") or []) for curve in derived),
             "derived_series": len(derived),
-            "status": curves["status"],
-            "reason": curves["reason"],
+            "derived_snapshot_count": sum(
+                int(curve.get("history_count") or 0) for curve in derived
+            ),
+            "official_fc_status": OFFICIAL_FC_CURVE_ACCESS,
+            "status": endpoint_status.get("status") or curves["status"],
+            "reason": endpoint_status.get("reason") or curves["reason"],
+            "quality_status": quality.get("status"),
+            "quality_reasons": quality.get("reason_codes") or [],
+            "quality": quality,
+            "expected_legs": quality.get("expected_legs"),
+            "available_legs": quality.get("available_legs"),
+            "latest_common_date": quality.get("latest_common_date"),
+            "missing_latest_legs": quality.get("missing_latest_legs") or [],
+            "duplicate_record_count": quality.get("duplicate_total_count", 0),
+            "anomaly_count": quality.get("anomaly_count", 0),
         }
-        for name in ("history", "curves", "moc"):
-            runtime = dict(specialized or {}).get(name)
+        for name, runtime in dict(specialized or {}).items():
             if name in datasets and isinstance(runtime, Mapping):
                 datasets[name] = self._with_runtime_status(datasets[name], runtime)
         return datasets
+
+    @classmethod
+    def _operational_dataset_health(
+        cls,
+        coverage: Mapping[str, Mapping[str, Any]],
+        *,
+        status: Mapping[str, Any],
+        news_configured: bool,
+        matrix: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Add user-facing capability, access, and pipeline state to coverage rows."""
+        datasets = {
+            str(key): dict(value) for key, value in coverage.items()
+            if isinstance(value, Mapping)
+        }
+        runs = [dict(row) for row in status.get("runs") or [] if isinstance(row, Mapping)]
+
+        def latest_run(source: str) -> Optional[Dict[str, Any]]:
+            return next((row for row in runs if row.get("source") == source), None)
+
+        def run_runtime(source: str) -> Optional[Dict[str, Any]]:
+            run = latest_run(source)
+            if not run:
+                return None
+            return {
+                "state": run.get("status") or "unknown",
+                "updated_at": run.get("finished_at") or run.get("started_at"),
+                "reason": run.get("error"),
+                "run_id": run.get("id"),
+                "rows_seen": run.get("rows_seen"),
+                "rows_inserted": run.get("rows_inserted"),
+                "rows_updated": run.get("rows_updated"),
+            }
+
+        news_runtime = run_runtime("lpg_news")
+        if news_runtime and "news" in datasets:
+            datasets["news"] = cls._with_runtime_status(datasets["news"], news_runtime)
+
+        intelligence = dict(status.get("intelligence") or {})
+        latest_event = intelligence.get("latest_event_at")
+        situation = {
+            "rows": int(intelligence.get("total") or 0),
+            "dates": 1 if latest_event else 0,
+            "series": 0,
+            "first_date": None,
+            "last_date": str(latest_event)[:10] if latest_event else None,
+            "active_rows": int(intelligence.get("active") or 0),
+            "located_rows": int(intelligence.get("located") or 0),
+            "confirmed_rows": int(intelligence.get("confirmed") or 0),
+            "status": "ready" if intelligence.get("total") else "empty",
+            "reason": None if intelligence.get("total") else "no_situation_events",
+        }
+        datasets["situation"] = (
+            cls._with_runtime_status(situation, news_runtime) if news_runtime else situation
+        )
+
+        vessel = dict(status.get("vessel_intelligence") or {})
+        latest_call = vessel.get("latest_port_call_at")
+        vessel_history = {
+            "rows": int(vessel.get("historical_port_calls") or 0),
+            "dates": 1 if latest_call else 0,
+            "series": int(vessel.get("vessels") or 0),
+            "first_date": None,
+            "last_date": str(latest_call)[:10] if latest_call else None,
+            "status": "ready" if vessel.get("historical_port_calls") else "empty",
+            "reason": None if vessel.get("historical_port_calls") else "no_vessel_history_snapshot",
+        }
+        vessel_runtime = run_runtime("vessel_snapshot")
+        datasets["vessel_history"] = (
+            cls._with_runtime_status(vessel_history, vessel_runtime)
+            if vessel_runtime else vessel_history
+        )
+
+        live_positions = int(vessel.get("live_positions") or 0)
+        stored_positions = int(vessel.get("positions") or 0)
+        if live_positions:
+            live_status, live_reason = "ready", None
+        elif stored_positions:
+            live_status, live_reason = "limited", "no_fresh_live_ais_positions"
+        else:
+            live_status, live_reason = "not_configured", "no_live_ais_provider_configured"
+        latest_position = vessel.get("latest_position_at")
+        datasets["live_ais"] = {
+            "rows": live_positions,
+            "stored_rows": stored_positions,
+            "dates": 1 if latest_position else 0,
+            "series": int(vessel.get("vessels") or 0) if stored_positions else 0,
+            "first_date": None,
+            "last_date": str(latest_position)[:10] if latest_position else None,
+            "status": live_status,
+            "reason": live_reason,
+        }
+
+        candidate_families = {
+            "current": {"price", "freight"},
+            "curves": {"curve", "spread"},
+            "moc": {"ewindow"},
+        }
+        for name, capability in DATASET_CAPABILITIES.items():
+            row = datasets.setdefault(name, {
+                "rows": 0, "dates": 0, "series": 0,
+                "first_date": None, "last_date": None,
+                "status": "empty", "reason": "dataset_not_loaded",
+            })
+            coverage_status = str(row.get("coverage_status") or row.get("status") or "empty")
+            coverage_reason = row.get("coverage_reason", row.get("reason"))
+            row.setdefault("coverage_status", coverage_status)
+            row.setdefault("coverage_reason", coverage_reason)
+            row.update(capability)
+
+            if not row.get("refresh_status"):
+                row["refresh_status"] = (
+                    "not_run" if capability["refresh_supported"]
+                    else "manual" if name == "vessel_history"
+                    else "not_supported"
+                )
+
+            if name == "fundamentals":
+                row["refresh_reason"] = "no_reliable_licensed_source_configured"
+                if row.get("rows"):
+                    row.update({
+                        "status": "available_with_warning",
+                        "reason": "stored_rows_available_without_refresh_pipeline",
+                    })
+                else:
+                    row.update({
+                        "status": "not_configured",
+                        "reason": "no_reliable_licensed_source_configured",
+                    })
+            elif name in {"current", "history", "curves", "moc"}:
+                if not row.get("rows") and row.get("refresh_status") == "not_run":
+                    row.update({
+                        "status": "not_loaded",
+                        "reason": f"{name}_refresh_not_run",
+                    })
+            if (name == "moc" and not row.get("rows")
+                    and row.get("refresh_status") in {
+                        "success", "empty", "discovery_only", "complete", "completed",
+                    }):
+                row.update({
+                    "status": "empty",
+                    "reason": "no_moc_rows_in_current_window",
+                    "access_check": "api_reached_no_matching_rows",
+                })
+
+            if name == "news":
+                row["access_mode"] = (
+                    "licensed_api_and_public_discovery" if news_configured
+                    else "public_discovery"
+                )
+                row["licensed_feed_status"] = (
+                    "configured" if news_configured else "not_configured"
+                )
+                if not news_configured:
+                    row["gap_reason"] = "licensed_news_api_not_configured"
+            elif name == "curves":
+                row["official_fc_status"] = OFFICIAL_FC_CURVE_ACCESS
+                row["official_refresh_supported"] = False
+                row["derivation_method"] = "daily_hm_snapshot_v2_quality"
+                if int(row.get("derived_series") or 0):
+                    row.pop("gap_reason", None)
+            elif name == "history" and row.get("refresh_status") in {
+                "error", "failed", "blocked", "refresh_failed",
+            }:
+                row["gap_reason"] = row.get("refresh_reason") or "history_backfill_failed"
+
+            families = candidate_families.get(name)
+            if families:
+                candidates = [item for item in matrix if str(item.get("family")) in families]
+                states: Dict[str, int] = defaultdict(int)
+                for item in candidates:
+                    states[str(item.get("discovery_status") or "unknown")] += 1
+                row["candidate_access"] = {
+                    "total": len(candidates), "states": dict(states),
+                }
+
+            state_name = str(row.get("status") or "unknown")
+            if row.get("rows"):
+                row["availability_group"] = (
+                    "available" if state_name == "ready" else "limited"
+                )
+            elif (name == "moc" and state_name == "empty"
+                  and row.get("access_check") == "api_reached_no_matching_rows"):
+                row["availability_group"] = "limited"
+            elif state_name in {"not_configured", "unavailable", "unentitled"}:
+                row["availability_group"] = "unavailable"
+            else:
+                row["availability_group"] = "not_loaded"
+            row["visible_now"] = bool(row.get("rows"))
+
+        return {name: datasets[name] for name in DATASET_CAPABILITIES}
+
+    @staticmethod
+    def _availability_summary(
+        datasets: Mapping[str, Mapping[str, Any]],
+    ) -> Dict[str, int]:
+        groups: Dict[str, int] = defaultdict(int)
+        refresh_issues = 0
+        for row in datasets.values():
+            groups[str(row.get("availability_group") or "not_loaded")] += 1
+            if str(row.get("refresh_status") or "") in {
+                "error", "failed", "blocked", "refresh_failed", "partial",
+            }:
+                refresh_issues += 1
+        return {
+            "total": len(datasets),
+            "available": groups["available"],
+            "limited": groups["limited"],
+            "not_loaded": groups["not_loaded"],
+            "unavailable": groups["unavailable"],
+            "visible_now": sum(bool(row.get("visible_now")) for row in datasets.values()),
+            "refresh_issues": refresh_issues,
+        }
 
     @staticmethod
     def _runtime_reason(runtime: Optional[Mapping[str, Any]]) -> Optional[str]:
@@ -886,18 +1698,31 @@ class LpgService:
         output = dict(coverage)
         if not runtime:
             return output
+        coverage_status = str(output.get("coverage_status") or output.get("status") or "empty")
+        coverage_reason = output.get("coverage_reason", output.get("reason"))
         state = str(runtime.get("state") or runtime.get("status") or "unknown").lower()
         reason = cls._runtime_reason(runtime)
         output.update({
+            "coverage_status": coverage_status,
+            "coverage_reason": coverage_reason,
             "refresh_state": state,
+            "refresh_status": state,
             "refresh_reason": reason,
+            "last_refresh_at": runtime.get("updated_at") or runtime.get("finished_at")
+                               or runtime.get("started_at"),
             "runtime_status": dict(runtime),
         })
         if state in {"error", "failed", "blocked", "refresh_failed"}:
-            output.update({
-                "status": "refresh_failed",
-                "reason": reason or "specialized_refresh_failed",
-            })
+            if int(output.get("rows") or 0) > 0:
+                output.update({
+                    "status": "available_with_warning",
+                    "reason": reason or "latest_refresh_failed_last_good_data_preserved",
+                })
+            else:
+                output.update({
+                    "status": "refresh_failed",
+                    "reason": reason or "specialized_refresh_failed",
+                })
         elif state in {"deferred", "not_run", "not_loaded", "pending", "queued",
                        "running", "in_progress", "unknown"} and not output.get("rows"):
             output.update({
@@ -910,6 +1735,18 @@ class LpgService:
                 "reason": reason or output.get("reason"),
             })
         return output
+
+    @staticmethod
+    def _daily_runtime_status() -> Dict[str, Any]:
+        try:
+            from .platts_excel import STAGING_DIR
+            path = Path(STAGING_DIR) / "status.json"
+            if not path.exists():
+                return {}
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return dict(payload) if isinstance(payload, Mapping) else {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
 
     @staticmethod
     def _specialized_runtime_statuses() -> Dict[str, Dict[str, Any]]:
@@ -1168,10 +2005,16 @@ class LpgService:
                 "workbook_mtime": payload.get("workbook_mtime"),
                 "input_path": input_path,
                 "staging_status": payload.get("status"),
+                "purpose": str(payload.get("purpose") or "daily").lower(),
             },
         )
         counts = {"rows_seen": len(records), "rows_inserted": 0,
                   "rows_updated": 0, "rows_skipped": 0}
+        input_quality = {
+            "rows_unchanged": 0,
+            "duplicate_input_rows": 0,
+            "duplicate_curve_leg_rows": 0,
+        }
         errors = [str(error) for error in (payload.get("errors") or [])]
         candidates = self.store.candidates()
         candidate_by_key = {}
@@ -1245,10 +2088,19 @@ class LpgService:
                 except (KeyError, ValueError) as exc:
                     errors.append(str(exc))
 
+        seen_record_keys: set[str] = set()
         for index, record in enumerate(records):
             try:
                 if not isinstance(record, Mapping):
                     raise ValueError("record is not an object")
+                logical_key = self._staging_record_identity(record)
+                if logical_key:
+                    if logical_key in seen_record_keys:
+                        input_quality["duplicate_input_rows"] += 1
+                        if str(record.get("canonical_key") or "") in DERIVED_PROMPT_COMPONENT_KEYS:
+                            input_quality["duplicate_curve_leg_rows"] += 1
+                    else:
+                        seen_record_keys.add(logical_key)
                 record_type = str(record.get("record_type") or "price_observation")
                 if record_type in {"price_observation", "correction"}:
                     series = self._ensure_staging_series(
@@ -1311,6 +2163,7 @@ class LpgService:
                 elif action == "updated":
                     counts["rows_updated"] += 1
                 else:
+                    input_quality["rows_unchanged"] += 1
                     counts["rows_skipped"] += 1
             except Exception as exc:  # isolate one bad/unentitled formula from the batch
                 counts["rows_skipped"] += 1
@@ -1343,7 +2196,7 @@ class LpgService:
 
         staging_ok = str(payload.get("status") or "success").lower() in {
             "success", "ok", "complete", "completed", "discovery_only",
-            "partial_success",
+            "partial_success", "empty",
         }
         if errors or not staging_ok:
             final_status = "partial" if counts["rows_inserted"] + counts["rows_updated"] > 0 else "failed"
@@ -1352,15 +2205,48 @@ class LpgService:
         finished = self.store.finish_run(
             run["id"], final_status, **counts,
             error="; ".join(errors[:20]) if errors else None,
+            metadata={
+                "rows_unchanged": input_quality["rows_unchanged"],
+                "duplicate_input_rows": input_quality["duplicate_input_rows"],
+                "duplicate_curve_leg_rows": input_quality["duplicate_curve_leg_rows"],
+            },
         )
         return json_safe({
             "success": final_status == "success",
             "status": final_status,
             "run": finished,
             "counts": counts,
+            "input_quality": input_quality,
             "discovery_rows": discovery_rows,
             "errors": errors,
         })
+
+    @staticmethod
+    def _staging_record_identity(record: Mapping[str, Any]) -> Optional[str]:
+        """Return the logical import key used to audit repeated workbook rows."""
+        record_type = str(record.get("record_type") or "price_observation").lower()
+        identity = (
+            record.get("series_id") or record.get("canonical_key") or
+            record.get("candidate_id") or record.get("symbol") or
+            record.get("data_series")
+        )
+        assess_date = record.get("assess_date") or record.get("observation_date")
+        if not identity or not assess_date:
+            return None
+        if record_type in {"price_observation", "correction"}:
+            suffix = str(record.get("bate") or "")
+            logical_type = "observation"
+        elif record_type == "curve_point":
+            suffix = str(
+                record.get("contract_label") or record.get("contract_date") or
+                record.get("contract_code") or record.get("symbol") or ""
+            )
+            logical_type = "curve_point"
+        else:
+            suffix = str(record.get("row_key") or record.get("trade_id") or "")
+            logical_type = record_type
+        seed = "|".join((logical_type, str(identity), str(assess_date), suffix))
+        return hashlib.sha1(seed.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _dataset_row_key(record: Mapping[str, Any], dataset: str) -> str:

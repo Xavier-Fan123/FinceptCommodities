@@ -226,9 +226,13 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
             status, curves["official_curve_count"], curves["derived_curve_count"],
         ))
         derived = next(curve for curve in curves["curves"] if curve["derived"])
-        self.assertEqual(("derived_prompt_structure", ["hm1", "hm2", "hm3"]), (
+        self.assertEqual(("daily_derived_assessment_curve", ["hm1", "hm2", "hm3"]), (
             derived["curve_kind"], derived["component_series_ids"],
         ))
+        self.assertEqual("daily_current_refresh", curves["quality"]["pipeline"])
+        self.assertEqual("persist_source_legs_rebuild_complete_snapshots",
+                         curves["quality"]["storage_policy"])
+        self.assertIn("quality", curves["dataset_status"])
         official = next(curve for curve in curves["curves"] if curve["is_official"])
         self.assertEqual("official_fc_curve", official["curve_kind"])
 
@@ -241,10 +245,16 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
         status, _, health = self.json_request("GET", "/api/lpg/status")
         self.assertEqual(200, status)
         datasets = health["datasets"]
-        self.assertEqual({"current", "history", "curves", "moc", "fundamentals"},
-                         set(datasets))
+        self.assertEqual({
+            "current", "history", "curves", "moc", "fundamentals",
+            "news", "situation", "vessel_history", "live_ais",
+        }, set(datasets))
         for dataset in datasets.values():
-            self.assertTrue({"rows", "dates", "series", "status", "reason"}
+            self.assertTrue({
+                "rows", "dates", "series", "status", "reason",
+                "coverage_status", "refresh_status", "availability_group",
+                "visible_now", "view", "refresh_supported", "access_mode",
+            }
                             .issubset(dataset))
         self.assertEqual(("partial", 1), (
             datasets["history"]["status"], datasets["history"]["multi_date_series"],
@@ -252,11 +262,24 @@ class LpgHttpApiTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual((1, "ready"), (
             datasets["moc"]["rows"], datasets["moc"]["status"],
         ))
-        self.assertEqual((1, "ready"), (
+        self.assertEqual((1, "available_with_warning", "not_supported"), (
             datasets["fundamentals"]["rows"], datasets["fundamentals"]["status"],
+            datasets["fundamentals"]["refresh_status"],
         ))
         self.assertEqual((1, 1), (
             datasets["curves"]["official_series"], datasets["curves"]["derived_series"],
+        ))
+        self.assertEqual((1, "ready", "public_discovery"), (
+            datasets["news"]["rows"], datasets["news"]["status"],
+            datasets["news"]["access_mode"],
+        ))
+        self.assertEqual(("not_configured", "unavailable", False), (
+            datasets["live_ais"]["status"], datasets["live_ais"]["availability_group"],
+            datasets["live_ais"]["visible_now"],
+        ))
+        self.assertEqual((9, 6), (
+            health["availability_summary"]["total"],
+            health["availability_summary"]["visible_now"],
         ))
 
     def test_refresh_job_and_validation_errors(self):

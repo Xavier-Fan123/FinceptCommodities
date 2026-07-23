@@ -3,7 +3,8 @@ param(
     [string]$Workbook,
     [int]$TimeoutSec = 240,
     [switch]$DryRun,
-    [switch]$DeElevatedRun
+    [switch]$DeElevatedRun,
+    [switch]$IsolatedInstance
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,14 +38,16 @@ if ($isElevated) {
     $logPath = Join-Path $tempRoot ("fincept-lpg-deelevated-$runToken.log")
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $taskRegistered = $false
+    $workbookWriteTimeBefore = (Get-Item -LiteralPath $Workbook).LastWriteTimeUtc.Ticks
     try {
         Write-Output 'ELEVATED_SHELL_DETECTED redispatching as the interactive user at Limited integrity'
+        $isolatedArgument = if ($IsolatedInstance) { ' -IsolatedInstance' } else { '' }
         @(
             '@echo off',
             'setlocal',
             ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath +
                 '" -Workbook "' + $Workbook + '" -TimeoutSec ' + $TimeoutSec +
-                ' -DeElevatedRun > "' + $logPath + '" 2>&1'),
+                ' -DeElevatedRun' + $isolatedArgument + ' > "' + $logPath + '" 2>&1'),
             'set "FINCEPT_LPG_EXIT=%ERRORLEVEL%"',
             ('echo EXIT=%FINCEPT_LPG_EXIT%>>"' + $logPath + '"'),
             'exit /b %FINCEPT_LPG_EXIT%'
@@ -65,6 +68,9 @@ if ($isElevated) {
 
         $deadline = (Get-Date).AddSeconds([Math]::Max(180, $TimeoutSec + 75))
         $exitMatch = $null
+        $workbookUpdated = $false
+        $lastUpdatedWriteTime = 0
+        $stableUpdatePasses = 0
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 2
             if (Test-Path -LiteralPath $logPath) {
@@ -72,13 +78,34 @@ if ($isElevated) {
                     Select-Object -Last 1
                 if ($exitMatch) { break }
             }
+            if ($IsolatedInstance) {
+                $currentWriteTime = (Get-Item -LiteralPath $Workbook).LastWriteTimeUtc.Ticks
+                if ($currentWriteTime -gt $workbookWriteTimeBefore) {
+                    if ($currentWriteTime -eq $lastUpdatedWriteTime) {
+                        $stableUpdatePasses++
+                    } else {
+                        $lastUpdatedWriteTime = $currentWriteTime
+                        $stableUpdatePasses = 0
+                    }
+                    if ($stableUpdatePasses -ge 2) {
+                        $workbookUpdated = $true
+                        break
+                    }
+                }
+            }
         }
-        if (-not $exitMatch) {
+        if (-not $exitMatch -and -not $workbookUpdated) {
             Write-Output 'DEELEVATED_RUN_TIMEOUT no exit marker was returned'
             exit 3
         }
-        Get-Content -LiteralPath $logPath | Where-Object { $_ -notmatch '^EXIT=-?\d+$' } |
-            ForEach-Object { Write-Output $_ }
+        if (Test-Path -LiteralPath $logPath) {
+            Get-Content -LiteralPath $logPath | Where-Object { $_ -notmatch '^EXIT=-?\d+$' } |
+                ForEach-Object { Write-Output $_ }
+        }
+        if ($workbookUpdated) {
+            Write-Output 'DEELEVATED_WORKBOOK_UPDATED saved workbook will be externally validated'
+            exit 0
+        }
         exit [int]$exitMatch.Matches[0].Groups[1].Value
     } catch {
         Write-Output ("DEELEVATED_RUN_FAILED " + $_.Exception.Message)
@@ -92,12 +119,17 @@ if ($isElevated) {
     }
 }
 
-# Never attach to or take focus from a workbook the user already has open.
-# Scheduled tasks repeat every 15 minutes for two hours, so exit 4 is a safe
-# defer signal rather than a failure or an invitation to kill Excel.
-if (Get-Process -Name EXCEL -ErrorAction SilentlyContinue) {
+# Daily scheduled refreshes never attach to or take focus from a workbook the
+# user already has open. Specialized history/curve/MOC probes may explicitly
+# request a separate /x Excel process; the ROT lookup below binds only that PID
+# and cleanup only terminates the process launched by this script.
+$existingExcel = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue)
+if ($existingExcel.Count -gt 0 -and -not $IsolatedInstance) {
     Write-Output 'DEFERRED_EXCEL_ALREADY_OPEN'
     exit 4
+}
+if ($existingExcel.Count -gt 0) {
+    Write-Output ("EXISTING_EXCEL_DETECTED count=" + $existingExcel.Count + " launching_isolated_instance")
 }
 
 try {
@@ -167,6 +199,24 @@ function Close-OwnedExcel {
     [GC]::WaitForPendingFinalizers()
     if ($null -ne $process) {
         try { $process | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue } catch {}
+        $owned = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+        if ($owned) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Stop-IsolatedExcelAfterSave {
+    # A completed Save is the durability boundary for disposable specialized
+    # workbooks. Graceful Workbook.Close/Quit can make this Add-in recalculate
+    # volatile UDFs during shutdown and hang after the data is already on disk.
+    # Release COM references, then terminate only the exact process we launched.
+    Release-ComObject $book
+    Release-ComObject $excel
+    $script:book = $null
+    $script:excel = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Start-Sleep -Seconds 3
+    if ($null -ne $process) {
         $owned = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
         if ($owned) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
     }
@@ -243,18 +293,73 @@ try {
     # process creation makes the Add-in take its COM-automation startup path and
     # leaves the ribbon signed out even when its UDF token is still valid.
     $stage = 'launching_excel'
-    $process = Start-Process -FilePath 'excel.exe' -ArgumentList "`"$Workbook`"" -PassThru
+    $excelArguments = @()
+    if ($IsolatedInstance) { $excelArguments += '/x' }
+    $excelArguments += "`"$Workbook`""
+    $process = Start-Process -FilePath 'excel.exe' -ArgumentList $excelArguments -PassThru
     Start-Sleep -Seconds 20
+    # WPS Office preloads an et.exe COM automation server (wps.exe /prometheus /et
+    # -> et.exe /Automation -Embedding) that also answers to the 'Excel.Application'
+    # ROT moniker. A plain GetActiveObject then binds to WPS - which has no Platts
+    # Add-in, so every UDF calculates to #NAME? while the real Excel sits untouched
+    # (this silently broke the refresh from 2026-07-17 08:50 onward). Enumerate the
+    # Running Object Table instead and accept only a COM object whose window belongs
+    # to the excel.exe process launched above.
+    Add-Type -ReferencedAssemblies 'Microsoft.CSharp', 'System.Core' -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+public static class ExcelRotFinder
+{
+    [DllImport("ole32.dll")]
+    private static extern int GetRunningObjectTable(uint reserved, out IRunningObjectTable prot);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    public static object GetApplicationForProcess(int processId)
+    {
+        IRunningObjectTable rot;
+        if (GetRunningObjectTable(0, out rot) != 0 || rot == null) return null;
+        IEnumMoniker enumMoniker;
+        rot.EnumRunning(out enumMoniker);
+        if (enumMoniker == null) return null;
+        enumMoniker.Reset();
+        var monikers = new IMoniker[1];
+        while (enumMoniker.Next(1, monikers, IntPtr.Zero) == 0)
+        {
+            object comObject = null;
+            try { rot.GetObject(monikers[0], out comObject); } catch { comObject = null; }
+            if (comObject == null) continue;
+            dynamic application = null;
+            try { application = ((dynamic)comObject).Application; }
+            catch { try { application = (dynamic)comObject; } catch { application = null; } }
+            if (application == null) continue;
+            try
+            {
+                long hwnd = (long)application.Hwnd;
+                uint ownerPid;
+                GetWindowThreadProcessId(new IntPtr(hwnd), out ownerPid);
+                if (ownerPid == (uint)processId) return application;
+            }
+            catch { }
+        }
+        return null;
+    }
+}
+'@
     $windowActivator = New-Object -ComObject WScript.Shell
     for ($attempt = 0; $attempt -lt 20 -and $null -eq $excel; $attempt++) {
         foreach ($windowTitle in @([System.IO.Path]::GetFileNameWithoutExtension($Workbook), 'Excel')) {
             try { [void]$windowActivator.AppActivate($windowTitle) } catch {}
         }
         Start-Sleep -Milliseconds 750
-        try { $excel = [Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application') }
-        catch { Start-Sleep -Seconds 2 }
+        try { $excel = [ExcelRotFinder]::GetApplicationForProcess($process.Id) }
+        catch { $excel = $null }
+        if ($null -eq $excel) { Start-Sleep -Seconds 2 }
     }
-    if ($null -eq $excel) { throw 'Excel did not register in the Running Object Table' }
+    if ($null -eq $excel) { throw 'The launched Excel process did not register in the Running Object Table' }
     $stage = 'configuring_excel'
     Invoke-WithComRetry {
         $excel.DisplayAlerts = $false
@@ -308,6 +413,68 @@ try {
         } -Attempts 60 -DelayMilliseconds 1000 | Out-Null
     }
     Write-Output ("RECALC_STARTED queries=" + $querySheets.Count)
+
+    if ($IsolatedInstance) {
+        # The Add-in writes large spilled ranges asynchronously. Reading
+        # UsedRange while FillSheet is still committing rows can make this
+        # Add-in build throw DISP_E_BADINDEX and close Excel even though the
+        # returned data is valid. Specialized workbooks are disposable and
+        # validated by Python after save, so give each isolated query a quiet
+        # settle window and persist without touching its result range here.
+        $stage = 'waiting_for_isolated_results'
+        $settleSeconds = [Math]::Min(
+            [Math]::Max(45, 30 + (15 * $querySheets.Count)),
+            [Math]::Max(45, $TimeoutSec)
+        )
+        $settleWatch = [Diagnostics.Stopwatch]::StartNew()
+        while ($settleWatch.Elapsed.TotalSeconds -lt $settleSeconds) {
+            Start-Sleep -Seconds 5
+            if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+                throw 'The isolated Excel process exited before the validation workbook was saved'
+            }
+        }
+        $stage = 'saving_for_external_validation'
+        $mtimeBeforeSave = (Get-Item -LiteralPath $Workbook).LastWriteTimeUtc.Ticks
+        try {
+            Invoke-WithComRetry {
+                try { $excel.CalculateBeforeSave = $false } catch {}
+                $runtime = $book.Worksheets.Item('_runtime_status')
+                try {
+                    $runtime.Cells.Item(2, 2).Value2 = 'success'
+                    $runtime.Cells.Item(3, 2).Value2 = [DateTime]::UtcNow.ToString('o')
+                    $runtime.Cells.Item(4, 2).Value2 = 0
+                    $runtime.Cells.Item(5, 2).Value2 = 0
+                    $runtime.Cells.Item(6, 2).Value2 = 'Saved after isolated Add-in calculation for external validation.'
+                } finally {
+                    Release-ComObject $runtime
+                }
+                $book.Save()
+            } -Attempts 3 -DelayMilliseconds 500 | Out-Null
+        } catch {
+            $mtimeAfterSave = (Get-Item -LiteralPath $Workbook).LastWriteTimeUtc.Ticks
+            $owned = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+            if (-not $owned -and $mtimeAfterSave -gt $mtimeBeforeSave) {
+                $saved = $true
+                Write-Output (
+                    "SAVED_AFTER_ADDIN_EXIT queries=" + $querySheets.Count +
+                    " settle=" + [int]$settleWatch.Elapsed.TotalSeconds
+                )
+                $script:book = $null
+                $script:excel = $null
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+                exit 0
+            }
+            throw
+        }
+        $saved = $true
+        Write-Output (
+            "SAVED_FOR_EXTERNAL_VALIDATION queries=" + $querySheets.Count +
+            " settle=" + [int]$settleWatch.Elapsed.TotalSeconds
+        )
+        Stop-IsolatedExcelAfterSave
+        exit 0
+    }
 
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $counts = @(0, 0, '', 0, 0)

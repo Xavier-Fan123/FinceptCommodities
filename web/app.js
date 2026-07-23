@@ -83,6 +83,9 @@ let state = {
   lpgNewsAutoTimer: null,
   lpgNewsLastLoadedAt: 0,
   lpgExplorer: { dataset: "series", query: "", entitlement: "all", offset: 0, limit: 100 },
+  lpgStatusDatasetFilter: "all",
+  lpgStatusCatalogFilter: "attention",
+  lpgStatusCatalogQuery: "",
   lpgRefreshTimer: null,
   lpgRefreshJob: null,
 };
@@ -1208,23 +1211,29 @@ function lpgStateInfo(value, stale = false) {
   const key = String(value || "unknown").toLowerCase().replace(/[\s-]+/g, "_");
   if (stale || key.includes("stale")) return { cls: "stale", label: "Stale / 已过期" };
   if (key === "ready") return { cls: "ok", label: "Ready / 可用" };
+  if (key === "available_with_warning") return { cls: "warn", label: "Available + issue / 可用但有异常" };
   if (["succeeded", "completed", "complete", "done"].includes(key)) return { cls: "ok", label: "Completed / 已完成" };
-  if (["entitled", "active", "ok", "success", "available", "fresh", "configured"].includes(key)) {
+  if (["entitled", "active", "ok", "success", "available", "fresh", "configured", "healthy"].includes(key)) {
     return { cls: "ok", label: key === "entitled" ? "Entitled / 已授权" : "Active / 正常" };
   }
   if (["unentitled", "denied", "forbidden", "unauthorized", "retired"].includes(key)) {
     return { cls: "bad", label: key === "retired" ? "Retired / 已停用" : "Unentitled / 未授权" };
   }
-  if (["pending", "pending_review", "queued", "running", "in_progress", "partial", "limited", "empty", "derived_only", "deferred", "no_data", "not_loaded", "not_configured"].includes(key)) {
+  if (["pending", "pending_review", "queued", "running", "in_progress", "partial", "limited", "warning", "incomplete", "empty", "derived_only", "deferred", "no_data", "not_loaded", "not_configured", "not_run"].includes(key)) {
     if (key === "partial") return { cls: "warn", label: "Partial / 部分完成" };
     if (key === "limited") return { cls: "warn", label: "Limited / 数据有限" };
+    if (key === "warning") return { cls: "warn", label: "Review / 待复核" };
+    if (key === "incomplete") return { cls: "warn", label: "Incomplete / 不完整" };
     if (key === "derived_only") return { cls: "warn", label: "Derived only / 仅派生结构" };
     if (key === "deferred") return { cls: "warn", label: "Deferred / 已延后" };
     if (["empty", "no_data"].includes(key)) return { cls: "warn", label: "No data / 暂无数据" };
     if (key === "not_loaded") return { cls: "warn", label: "Not loaded / 尚未加载" };
+    if (key === "not_run") return { cls: "warn", label: "Not run / 尚未执行" };
     if (key === "not_configured") return { cls: "warn", label: "Not configured / 未配置" };
     return { cls: "warn", label: key.includes("pending") ? "Pending / 待确认" : "Running / 刷新中" };
   }
+  if (key === "manual") return { cls: "neutral", label: "Manual snapshot / 手动快照" };
+  if (key === "not_supported") return { cls: "neutral", label: "No refresh pipeline / 无刷新管道" };
   if (key === "unavailable") return { cls: "bad", label: "Unavailable / 暂不可用" };
   if (["error", "failed", "refresh_failed", "degraded", "blocked"].includes(key)) return { cls: "bad", label: "Error / 异常" };
   return { cls: "neutral", label: value ? String(value) : "Unknown / 未知" };
@@ -1285,6 +1294,16 @@ function lpgSection(title, meta, children, cls = "") {
   const head = el("div", { class: "lpg-section-head" }, [el("h3", { text: title })]);
   if (meta) head.appendChild(el("span", { class: "meta", text: meta }));
   return el("section", { class: `lpg-section ${cls}`.trim() }, [head, ...[].concat(children || []).filter(Boolean)]);
+}
+
+function lpgDisclosure(title, meta, children, open = false) {
+  const summary = el("summary", { class: "lpg-disclosure-head" }, [
+    el("strong", { text: title }),
+    meta ? el("span", { class: "meta", text: meta }) : null,
+  ].filter(Boolean));
+  const details = el("details", { class: "lpg-disclosure", open: open ? "open" : null }, [summary]);
+  details.append(...[].concat(children || []).filter(Boolean));
+  return details;
 }
 
 function lpgTable(columns, rows, options = {}) {
@@ -1737,7 +1756,8 @@ function renderLpgCockpit(data) {
 
 function lpgIsDerivedCurve(curve) {
   return curve && (curve.derived === true || String(curve.derived || "").toLowerCase() === "true"
-    || ["derived", "derived_prompt_structure"].includes(String(curve.curve_type || curve.curve_kind || "").toLowerCase()));
+    || ["derived", "derived_prompt_structure", "daily_derived_assessment_curve"]
+      .includes(String(curve.curve_type || curve.curve_kind || "").toLowerCase()));
 }
 
 function lpgCurveAllowed(curve, allowedIds) {
@@ -1747,12 +1767,84 @@ function lpgCurveAllowed(curve, allowedIds) {
   return ids.length > 0 && ids.every(id => allowedIds.has(id));
 }
 
+function lpgCurveQualityMonitor(quality) {
+  if (!quality || typeof quality !== "object" || quality.status === "not_applicable") return null;
+  const components = Array.isArray(quality.components) ? quality.components : [];
+  const reasons = Array.isArray(quality.reason_codes) ? quality.reason_codes : [];
+  const missing = Array.isArray(quality.missing_latest_legs) ? quality.missing_latest_legs : [];
+  const anomalies = Array.isArray(quality.anomalies) ? quality.anomalies.slice(-12).reverse() : [];
+  const latestImport = quality.latest_daily_import || {};
+  const freshness = quality.latest_common_freshness || {};
+  const stateInfo = lpgStateInfo(quality.status || "unknown");
+  const issueItems = reasons.length
+    ? reasons.map(reason => {
+      const [title, detail] = lpgStatusReason({ reason });
+      return el("div", { class: "lpg-curve-quality-issue" }, [
+        el("strong", { text: title }),
+        el("span", { text: detail }),
+      ]);
+    })
+    : [el("div", { class: "lpg-curve-quality-issue ok" }, [
+      el("strong", { text: "All six daily HM legs align / 六条日度HM腿完整对齐" }),
+      el("span", { text: "The latest curve date is common, duplicate-free and inside the freshness threshold." }),
+    ])];
+  const banner = el("div", { class: `lpg-curve-quality-banner ${stateInfo.cls}` }, [
+    el("div", {}, [
+      lpgBadge(quality.status || "unknown"),
+      el("strong", { text: "Daily curve pipeline / 日度曲线管道" }),
+    ]),
+    el("span", { text: missing.length
+      ? `Missing on latest date: ${missing.join(", ")}`
+      : "Complete snapshots require same-date HM1/HM2/HM3; incomplete legs are retained but not materialized as a curve." }),
+  ]);
+  const stats = el("div", { class: "lpg-stat-strip lpg-curve-quality-stats" }, [
+    lpgStat("Leg coverage / 腿覆盖", `${quality.available_legs || 0}/${quality.expected_legs || 0}`),
+    lpgStat("Latest common / 共同最新日", quality.latest_common_date || "N/A"),
+    lpgStat("Common six-leg days / 六腿共同日", Number(quality.common_six_leg_snapshot_count || 0).toLocaleString()),
+    lpgStat("Generated snapshots / 已生成快照", Number(quality.generated_snapshot_count || 0).toLocaleString()),
+    lpgStat("Freshness / 新鲜度", freshness.business_days === null || freshness.business_days === undefined
+      ? "N/A" : `${freshness.business_days} business day(s)`),
+    lpgStat("Duplicates / 重复", Number(quality.duplicate_total_count
+      ?? (Number(quality.duplicate_record_count || 0) + Number(latestImport.duplicate_curve_leg_rows || 0)))),
+    lpgStat("Jump flags / 跳价", Number(quality.anomaly_count || 0).toLocaleString()),
+  ]);
+  const componentTable = components.length ? lpgTable([
+    { label: "Curve", render: row => String(row.curve_key || "").replace(/_PROMPT_STRUCTURE$/, "") },
+    { label: "Leg", render: row => `${row.tenor || ""} · ${row.canonical_key || ""}` },
+    { label: "Observations", class: "num", render: row => Number(row.observation_count || 0).toLocaleString() },
+    { label: "Latest", render: row => lpgDate(row.last_date) },
+    { label: "Freshness", render: row => lpgBadge((row.freshness && row.freshness.status) || row.status || "missing") },
+    { label: "Duplicates", class: "num", render: row => Number(row.duplicate_record_count || 0).toLocaleString() },
+    { label: "Jump flags", class: "num", render: row => Number(row.anomaly_count || 0).toLocaleString() },
+  ], components) : null;
+  const anomalyTable = anomalies.length ? lpgDisclosure(
+    "Flagged daily moves / 待复核日度跳价",
+    `${anomalies.length} recent flags; values are retained`,
+    lpgTable([
+      { label: "Leg", render: row => `${row.tenor || ""} · ${row.canonical_key || ""}` },
+      { label: "Date", render: row => lpgDate(row.date) },
+      { label: "Move", class: "num", render: row => `${lpgNumber(row.change, 2)} (${lpgNumber(row.pct_change, 2)}%)` },
+      { label: "Value", class: "num", render: row => `${lpgNumber(row.prior_value, 2)} → ${lpgNumber(row.value, 2)}` },
+      { label: "Rule", render: row => (row.reasons || []).join(", ") },
+    ], anomalies),
+  ) : null;
+  return lpgSection(
+    "Daily Curve Pipeline Quality / 日度曲线管道质量",
+    `${quality.available_legs || 0}/${quality.expected_legs || 0} legs · common ${quality.latest_common_date || "N/A"}`,
+    [banner, stats, el("div", { class: "lpg-curve-quality-issues" }, issueItems), componentTable, anomalyTable].filter(Boolean),
+    "lpg-curve-quality",
+  );
+}
+
 function renderLpgCurves(payload) {
   const errors = payload._load_errors || {};
   const curvesData = lpgPayload(payload.curves || {});
   const spreadsData = lpgPayload(payload.spreads || {});
   const allowedIds = lpgAllowedSeriesIds(payload.access_catalog);
   const rawCurves = lpgList(curvesData, ["curves", "items"]);
+  const qualityMonitor = lpgCurveQualityMonitor(
+    curvesData.quality || (curvesData.dataset_status && curvesData.dataset_status.quality),
+  );
   const curves = rawCurves.filter(curve => lpgCurveAllowed(curve, allowedIds));
   const spreads = lpgList(spreadsData, ["items", "spreads"])
     .filter(row => errors.catalog || lpgSpreadAllowed(row, allowedIds));
@@ -1766,6 +1858,8 @@ function renderLpgCurves(payload) {
     });
     const values = points.map(point => Number(lpgValue(point, "value", "price")));
     const labels = points.map(point => lpgValue(point, "contract_month", "tenor", "delivery_start") || "");
+    const shape = curve.shape && typeof curve.shape === "object" ? curve.shape : {};
+    const dailyHistory = Array.isArray(curve.history) ? curve.history.slice(-10).reverse() : [];
     const chart = values.length > 1
       ? withHover(svgLine(values, { h: 150, dots: true, xlabels: labels }), values.length,
         index => `${labels[index]} | ${lpgNumber(values[index], 2)} ${curve.currency || ""}/${curve.unit || ""}`, { h: 150 })
@@ -1778,21 +1872,40 @@ function renderLpgCurves(payload) {
       { label: "Value", class: "num", render: row => `${lpgNumber(lpgValue(row, "value", "price"), 2)} ${lpgValue(row, "currency") || curve.currency || ""}/${lpgValue(row, "unit") || curve.unit || ""}` },
       { label: "As of", render: row => lpgDate(lpgValue(row, "as_of_date", "observation_date", "date", "as_of") || curve.as_of_date || curvesData.as_of) },
       { label: "State", render: row => derived
-        ? el("span", { class: "lpg-badge neutral", text: "Derived / 近端结构", title: "Derived from entitled prompt assessments; not an official FC curve." })
+        ? el("span", { class: "lpg-badge neutral", text: "Daily-derived / 日度推导", title: "Built from entitled daily HM assessments; not an official FC curve." })
         : lpgBadge(lpgValue(row, "entitlement_state", "entitlement", "access_status") || lpgValue(curve, "entitlement_state", "entitlement") || "entitled", lpgIsStale(row) || lpgIsStale(curve)) },
     ], points, { empty: "No curve point data / 暂无曲线点数据" });
+    const derivedSummary = derived ? el("div", { class: "lpg-derived-curve-summary" }, [
+      el("span", {}, [el("small", { text: "Shape / 结构" }), el("strong", { text: String(shape.structure || "N/A") })]),
+      el("span", {}, [el("small", { text: "HM1−HM2" }), el("strong", { text: lpgNumber(shape.hm1_hm2, 2) })]),
+      el("span", {}, [el("small", { text: "HM2−HM3" }), el("strong", { text: lpgNumber(shape.hm2_hm3, 2) })]),
+      el("span", {}, [el("small", { text: "Daily snapshots / 日度快照" }), el("strong", { text: String(curve.history_count || dailyHistory.length || 0) })]),
+    ]) : null;
+    const historyTable = derived && dailyHistory.length > 1 ? el("details", { class: "lpg-derived-history" }, [
+      el("summary", { text: `Recent daily snapshots / 近期日度快照 (${dailyHistory.length})` }),
+      lpgTable([
+        { label: "As of", render: row => lpgDate(row.as_of_date) },
+        { label: "HM1", class: "num", render: row => lpgNumber(row.values && row.values.HM1, 2) },
+        { label: "HM2", class: "num", render: row => lpgNumber(row.values && row.values.HM2, 2) },
+        { label: "HM3", class: "num", render: row => lpgNumber(row.values && row.values.HM3, 2) },
+        { label: "HM1−HM2", class: "num", render: row => lpgNumber(row.hm1_hm2, 2) },
+        { label: "Shape", render: row => row.structure || "N/A" },
+      ], dailyHistory),
+    ]) : null;
     curveList.appendChild(el("article", { class: "lpg-curve-block" }, [
       el("div", { class: "lpg-curve-title" }, [
         el("strong", { text: lpgValue(curve, "name", "canonical_key", "series_id") || "Forward curve" }),
         derived ? el("span", {
           class: "lpg-badge neutral",
-          text: "Derived prompt structure / 近端结构",
-          title: "Built from entitled prompt assessments; this is not an official Platts FC curve.",
+          text: "Daily-derived curve / 日度推导曲线",
+          title: "Rebuilt from entitled HM1/HM2/HM3 daily assessments; this is not an official Platts FC curve.",
         }) : null,
         el("span", { class: "meta", text: `${points.length} points | ${curve.currency || "N/A"}/${curve.unit || "N/A"}` }),
       ].filter(Boolean)),
+      derivedSummary,
       el("div", { class: "lpg-curve-layout" }, [chart, table]),
-    ]));
+      historyTable,
+    ].filter(Boolean)));
   }
   if (!curves.length) {
     if (errors.curves) curveList.appendChild(lpgDatasetEmpty("curves", curvesData, errors.curves));
@@ -1814,7 +1927,8 @@ function renderLpgCurves(payload) {
   const derivedCount = curves.filter(lpgIsDerivedCurve).length;
   byId("lpg-body").replaceChildren(...[
     notice,
-    lpgSection("Forward Curves", `${curves.length} curves${derivedCount ? ` | ${derivedCount} derived` : ""}`, curveList),
+    qualityMonitor,
+    lpgSection("Daily-derived Curves / 日度推导曲线", `${curves.length} curves${derivedCount ? ` | ${derivedCount} daily-derived` : ""}`, curveList),
     lpgSection("Calendar, Feedstock & Arb Spreads", `${spreads.length} calculations`, spreadContent),
   ].filter(Boolean));
 }
@@ -2622,10 +2736,245 @@ function lpgRefreshRows(row) {
   return 0;
 }
 
+const LPG_STATUS_DATASETS = {
+  current: { label: "Current prices / 当前价格", category: "Market data / 市场数据" },
+  history: { label: "History / 历史价格", category: "Market data / 市场数据" },
+  curves: { label: "Daily-derived curves / 日度推导曲线", category: "Market data / 市场数据" },
+  moc: { label: "MOC / eWindow", category: "Market data / 市场数据" },
+  fundamentals: { label: "Fundamentals / 基本面", category: "Market data / 市场数据" },
+  news: { label: "LPG news / LPG新闻", category: "Intelligence / 情报" },
+  situation: { label: "Situation intelligence / 情景情报", category: "Intelligence / 情报" },
+  vessel_history: { label: "Vessel history / 船舶历史", category: "Shipping / 航运" },
+  live_ais: { label: "Live AIS positions / 实时AIS", category: "Shipping / 航运" },
+};
+
+const LPG_STATUS_REASON_COPY = {
+  excel_session_or_formula_unresolved: [
+    "Last-good history is still available / 历史数据仍可查看",
+    "The last History-Symbol workbook did not resolve in the Excel/Add-in session. Existing rows are preserved; retry the history refresh from a healthy signed-in Excel session.",
+  ],
+  official_curve_points_not_available: [
+    "Derived structure is visible / 可查看派生近端结构",
+    "Official FC curve points are not loaded. The visible curves are derived from entitled prompt assessments and are clearly kept separate from official curves.",
+  ],
+  official_curve_points_missing_using_derived_prompt_structure: [
+    "Derived structure is visible / 可查看派生近端结构",
+    "Official FC curve points are missing; current cards use entitled prompt assessments only and are not presented as official Platts curves.",
+  ],
+  official_fc_curve_entitlement_not_available: [
+    "Daily-derived curves are used / 使用日度推导曲线",
+    "This account has no official FC curve entitlement. Curves are rebuilt from entitled daily HM assessments without interpolation or forward-fill.",
+  ],
+  six_leg_latest_date_incomplete: [
+    "Latest six-leg set is incomplete / 最新六腿数据不完整",
+    "The source observations are retained, but no curve snapshot is generated until all required HM legs share the same assessment date.",
+  ],
+  latest_curve_date_incomplete: [
+    "Latest curve date is incomplete / 最新曲线日期缺腿",
+    "At least one HM leg is missing on the newest observed date. The last complete curve remains visible and the incomplete daily legs remain stored.",
+  ],
+  incomplete_curve_dates_detected: [
+    "Daily curve gaps detected / 检测到日度曲线缺口",
+    "Some assessment dates do not contain all three HM legs. Those dates are excluded from derived snapshots without forward-fill.",
+  ],
+  curve_pipeline_delayed: [
+    "Curve pipeline is delayed / 曲线管道有延迟",
+    "The latest complete six-leg date is two or more business days old. Existing snapshots remain usable with a freshness warning.",
+  ],
+  curve_pipeline_stale: [
+    "Curve pipeline is stale / 曲线管道已过期",
+    "The latest complete six-leg date is more than three business days old. Refresh daily prices before relying on the current structure.",
+  ],
+  abnormal_daily_jump_detected: [
+    "Large daily move needs review / 日度异常跳价待复核",
+    "A source leg crossed the absolute, percentage, or robust-change threshold. The value is retained and the curve is flagged rather than silently altered.",
+  ],
+  duplicate_curve_input_records: [
+    "Duplicate curve inputs detected / 检测到重复曲线输入",
+    "Repeated logical observations were detected during curve assembly. The deterministic preferred record is used and the duplicate remains visible in quality diagnostics.",
+  ],
+  duplicate_daily_refresh_rows: [
+    "Duplicate workbook rows detected / 刷新工作簿存在重复行",
+    "The latest daily workbook contained repeated logical keys. SQLite upsert remained idempotent and the duplicate count is recorded for review.",
+  ],
+  curve_unit_or_currency_mismatch: [
+    "Curve units do not align / 曲线单位或币种不一致",
+    "The source legs are retained, but a daily snapshot is skipped when currency or unit alignment is not exact.",
+  ],
+  missing_or_unentitled_component: [
+    "Required HM leg is unavailable / 必需HM腿不可用",
+    "One or more daily HM components are missing or unentitled, so the affected derived curve is not generated.",
+  ],
+  no_complete_six_leg_snapshot: [
+    "No complete six-leg date / 暂无六腿共同日期",
+    "All available source observations are retained, but there is no date on which both three-leg curves are simultaneously complete.",
+  ],
+  moc_refresh_not_run: [
+    "MOC pipeline has not completed / MOC尚未完成刷新",
+    "The eWindow workbook pipeline exists, but no usable MOC rows have been imported yet. Run the dedicated MOC refresh to test the current session and access.",
+  ],
+  no_moc_rows_in_current_window: [
+    "Checked empty / 已检查但当前窗口无成交",
+    "The eWindow TradeData endpoint was reached successfully, but the current Asia LPG lookback returned no matching rows. This is not labelled unentitled.",
+  ],
+  no_reliable_licensed_source_configured: [
+    "No Fundamentals pipeline / 尚无基本面数据管道",
+    "No reliable licensed Fundamentals source is connected. This is a product/source gap, not a temporary empty response, so refresh is intentionally disabled.",
+  ],
+  licensed_news_api_not_configured: [
+    "Public discovery is live / 公共新闻发现可用",
+    "Attributed public and official-publication feeds are available. Machine-readable S&P Global/Platts News requires a separate entitlement and is not configured.",
+  ],
+  no_live_ais_provider_configured: [
+    "Historical calls only / 仅有历史靠港记录",
+    "The map can show audited historical port calls, but no entitled live AIS position provider is connected. Historical points are never labelled as live tracks.",
+  ],
+  no_fresh_live_ais_positions: [
+    "No fresh live position / 暂无新鲜实时位置",
+    "Stored position evidence exists, but none currently meets the live freshness rule.",
+  ],
+  no_situation_events: [
+    "Situation layer not built / 情报层尚未生成",
+    "Refresh News to rebuild attributed disruption events and map signals.",
+  ],
+  no_vessel_history_snapshot: [
+    "No vessel snapshot / 尚无船舶历史快照",
+    "Historical vessel calls require a separately imported, auditable local snapshot.",
+  ],
+  current_refresh_not_run: [
+    "Current prices not loaded / 当前价格尚未加载",
+    "Run an Asia, Overnight, or All refresh from a signed-in Excel session.",
+  ],
+  history_refresh_not_run: [
+    "History backfill not run / 历史回填尚未执行",
+    "Choose an entitled series in History and run the targeted backfill.",
+  ],
+};
+
+const LPG_STATUS_ACCESS_COPY = {
+  licensed_excel: "S&P Excel entitlement / S&P Excel授权",
+  licensed_excel_or_derived: "Official when loaded; otherwise derived / 官方或明确派生",
+  derived_from_licensed_daily_assessments: "Derived from entitled daily assessments / 由已授权日度评估价推导",
+  licensed_api_and_public_discovery: "Licensed API + public discovery / 授权API及公共发现",
+  public_discovery: "Attributed public discovery / 署名公共发现",
+  derived_from_attributed_news: "Derived from attributed news / 由署名新闻派生",
+  local_snapshot: "Audited local snapshot / 可审计本地快照",
+  not_configured: "Source not connected / 数据源未连接",
+};
+
+function lpgStatusReason(row) {
+  const raw = lpgValue(row, "gap_reason", "refresh_reason", "reason", "coverage_reason");
+  if (!raw) return ["Usable now / 当前可用", "Data is loaded and the latest recorded refresh has no blocking error."];
+  const key = String(raw).toLowerCase();
+  return LPG_STATUS_REASON_COPY[key] || [
+    String(raw).replace(/_/g, " "),
+    "See source and refresh diagnostics below for the recorded technical state / 详见下方数据源及刷新诊断。",
+  ];
+}
+
+function lpgStatusCoverageText(row) {
+  const n = value => Number(value || 0).toLocaleString();
+  const date = row.last_date ? ` · latest ${lpgDate(row.last_date)}` : "";
+  if (row.dataset === "current") return `${n(row.series)} series · ${n(row.rows)} assessments${date}`;
+  if (row.dataset === "history") return `${n(row.rows)} observations · ${n(row.dates)} dates · ${n(row.multi_date_series)} multi-date series${date}`;
+  if (row.dataset === "curves") return `${n(row.derived_series)} daily-derived · ${n(row.derived_snapshot_count)} snapshots · ${n(row.available_legs)}/${n(row.expected_legs)} legs · common ${row.latest_common_date ? lpgDate(row.latest_common_date) : "N/A"}${date}`;
+  if (row.dataset === "news") return `${n(row.rows)} articles · ${n(row.sources || row.series)} sources${date}`;
+  if (row.dataset === "situation") return `${n(row.rows)} signals · ${n(row.active_rows)} active · ${n(row.confirmed_rows)} confirmed${date}`;
+  if (row.dataset === "vessel_history") return `${n(row.rows)} historical calls · ${n(row.series)} vessels${date}`;
+  if (row.dataset === "live_ais") return `${n(row.rows)} live positions · ${n(row.stored_rows)} stored positions${date}`;
+  return `${n(row.rows)} rows · ${n(row.dates)} dates · ${n(row.series)} series${date}`;
+}
+
+function lpgStatusLine(label, value) {
+  const node = el("div", { class: "lpg-availability-state" }, [el("span", { text: label })]);
+  if (value instanceof Node) node.appendChild(value);
+  else node.appendChild(el("strong", { text: String(value || "N/A") }));
+  return node;
+}
+
+function lpgStatusDatasetCard(row) {
+  const ui = LPG_STATUS_DATASETS[row.dataset] || { label: row.label || row.dataset, category: row.category || "Dataset" };
+  const [reasonTitle, reasonDetail] = lpgStatusReason(row);
+  const group = row.availability_group || "not_loaded";
+  const card = el("article", { class: `lpg-availability-card ${group}` }, [
+    el("div", { class: "lpg-availability-card-head" }, [
+      el("div", {}, [
+        el("strong", { text: ui.label }),
+        el("small", { text: ui.category }),
+      ]),
+      lpgBadge(row.status || "not_loaded", false, row.reason || ""),
+    ]),
+    el("div", { class: "lpg-availability-metric", text: lpgStatusCoverageText(row) }),
+    el("div", { class: "lpg-availability-states" }, [
+      lpgStatusLine("Data / 数据", lpgBadge(row.coverage_status || row.status || "not_loaded")),
+      lpgStatusLine("Refresh / 刷新", lpgBadge(row.refresh_status || "not_run", false, row.refresh_reason || "")),
+      lpgStatusLine("Access / 边界", LPG_STATUS_ACCESS_COPY[row.access_mode] || String(row.access_mode || "Unknown")),
+      row.dataset === "curves"
+        ? lpgStatusLine("Curve QA / 曲线质检", lpgBadge(row.quality_status || "unknown", false, (row.quality_reasons || []).join(", ")))
+        : null,
+    ].filter(Boolean)),
+    el("div", { class: "lpg-availability-explain" }, [
+      el("strong", { text: reasonTitle }),
+      el("span", { text: reasonDetail }),
+    ]),
+  ]);
+  const actions = el("div", { class: "lpg-availability-actions" });
+  if (row.view) {
+    const open = el("button", { type: "button", class: "lpg-card-action", text: "Open data / 打开数据" });
+    open.onclick = () => {
+      if (row.dataset === "fundamentals") state.lpgMocDataset = "fundamentals";
+      else if (row.dataset === "moc") state.lpgMocDataset = "moc";
+      location.hash = row.view === "cockpit" ? "#/lpg" : `#/lpg/${row.view}`;
+    };
+    actions.appendChild(open);
+  }
+  if (row.refresh_supported && row.refresh_scope) {
+    const refreshText = row.refresh_label === "Refresh daily prices"
+      ? "Refresh daily prices / 刷新日度价格"
+      : row.refresh_scope === "all" ? "Refresh all / 全量刷新" : "Retry refresh / 重试刷新";
+    const refresh = el("button", {
+      type: "button", class: "lpg-card-action primary",
+      text: refreshText,
+      disabled: state.lpgRefreshJob && state.lpgRefreshJob.running ? "disabled" : null,
+      title: `Start ${row.refresh_scope} refresh`,
+    });
+    refresh.onclick = () => startLpgRefresh(row.refresh_scope);
+    actions.appendChild(refresh);
+  }
+  if (actions.childNodes.length) card.appendChild(actions);
+  return card;
+}
+
+function lpgStatusFilterButton(id, label, count, data) {
+  const active = state.lpgStatusDatasetFilter === id;
+  const button = el("button", {
+    type: "button", class: `lpg-filter-chip${active ? " active" : ""}`,
+    text: `${label} ${count}`, "aria-pressed": String(active),
+  });
+  button.onclick = () => {
+    state.lpgStatusDatasetFilter = id;
+    renderLpgStatus(data);
+  };
+  return button;
+}
+
+function lpgCandidateReason(row) {
+  const reason = String(row.error || row.entitlement_reason || "").toLowerCase();
+  if (reason === "data_returned") return "Data returned / 已返回数据";
+  if (reason === "symbol_not_confirmed") return "Symbol not confirmed; not an entitlement denial / Symbol尚未确认，不等于未授权";
+  if (reason === "session_or_formula_error") return "Excel/Add-in formula unresolved; entitlement not proven / 公式未完成，不能据此判定未授权";
+  if (reason === "not_entitled_or_invalid_symbol") return "Not entitled or invalid symbol; requires symbol-level review / 未授权或Symbol无效，需逐项核查";
+  if (reason === "official_fc_curve_entitlement_not_available") return "Official FC curve is not entitled for this account; daily-derived HM curves are used / 本账号无官方FC曲线权限，改用HM日度推导曲线";
+  return reason ? reason.replace(/_/g, " ") : "No diagnostic recorded / 暂无诊断";
+}
+
 function renderLpgStatus(data) {
   const catalog = data.catalog || {};
   const states = catalog.states || catalog.entitlement_states || {};
+  const candidates = data.candidates || {};
+  const candidateStates = candidates.states || {};
   const sources = lpgList(data, ["sources", "source_status"]);
+  const newsSources = lpgList(data, ["news_sources"]);
   const runs = lpgList(data, ["runs", "refresh_runs"]);
   const managerJobs = lpgList(data, ["jobs"]);
   const activeJob = data.active_job || managerJobs.find(job => ["queued", "running", "in_progress"].includes(
@@ -2639,29 +2988,109 @@ function renderLpgStatus(data) {
     if (id) seenJobs.add(id);
     return true;
   });
-  const specializedByScope = new Map();
-  for (const job of specializedJobs) {
-    const scope = String(job.scope || "").toLowerCase();
-    if (!specializedByScope.has(scope)) specializedByScope.set(scope, job);
-  }
-  const datasetLabels = {
-    current: "Current prices", history: "History", curves: "Forward curves",
-    moc: "MOC / eWindow", fundamentals: "Fundamentals",
-  };
   const datasets = Object.entries(data.datasets || {}).map(([dataset, health]) => ({
     dataset, ...(health && typeof health === "object" ? health : {}),
-    refresh_job: specializedByScope.get(dataset) || null,
   }));
-  const candidates = data.candidates || {};
-  const candidateStates = candidates.states || {};
-  const matrix = lpgList(data, ["entitlement_matrix"]);
-  const statStrip = el("div", { class: "lpg-stat-strip" }, [
-    lpgStat("Candidates", Number(candidates.total || matrix.length || 0).toLocaleString()),
-    lpgStat("Entitled", Number(states.entitled || candidateStates.entitled || 0).toLocaleString()),
-    lpgStat("Unentitled", Number(states.unentitled || candidateStates.unentitled || 0).toLocaleString()),
-    lpgStat("Pending review", Number(states.pending_review || candidateStates.pending_review || 0).toLocaleString()),
-    lpgStat("Sources active", sources.filter(source => lpgStateInfo(source.status).cls === "ok").length.toString()),
+  const summary = data.availability_summary || {};
+  const datasetCounts = {
+    all: datasets.length,
+    available: datasets.filter(row => row.availability_group === "available").length,
+    attention: datasets.filter(row => ["limited", "not_loaded"].includes(row.availability_group)).length,
+    unavailable: datasets.filter(row => row.availability_group === "unavailable").length,
+  };
+  const visibleDatasets = datasets.filter(row => {
+    if (state.lpgStatusDatasetFilter === "all") return true;
+    if (state.lpgStatusDatasetFilter === "attention") return ["limited", "not_loaded"].includes(row.availability_group);
+    return row.availability_group === state.lpgStatusDatasetFilter;
+  });
+  const availabilityToolbar = el("div", { class: "lpg-status-toolbar" }, [
+    el("span", { text: "Show / 显示" }),
+    lpgStatusFilterButton("all", "All", datasetCounts.all, data),
+    lpgStatusFilterButton("available", "Ready", datasetCounts.available, data),
+    lpgStatusFilterButton("attention", "Needs attention", datasetCounts.attention, data),
+    lpgStatusFilterButton("unavailable", "Not connected", datasetCounts.unavailable, data),
   ]);
+  const availabilityGrid = visibleDatasets.length
+    ? el("div", { class: "lpg-availability-grid" }, visibleDatasets.map(lpgStatusDatasetCard))
+    : lpgEmpty("No datasets in this filter / 当前筛选无数据集");
+
+  const matrix = lpgList(data, ["entitlement_matrix"]);
+  const catalogQuery = state.lpgStatusCatalogQuery.trim().toLowerCase();
+  const catalogFilter = state.lpgStatusCatalogFilter;
+  const filteredMatrix = matrix.filter(row => {
+    const access = String(lpgValue(row, "discovery_status", "entitlement_state", "status") || "unknown").toLowerCase();
+    const stateMatch = catalogFilter === "all"
+      || (catalogFilter === "attention" ? access !== "entitled" : access === catalogFilter);
+    const text = [row.name, row.canonical_key, row.candidate_id, row.mapped_symbol,
+      row.discovered_symbol, row.discovered_curve_code, row.product, row.market,
+      row.location, row.family].filter(Boolean).join(" ").toLowerCase();
+    return stateMatch && (!catalogQuery || text.includes(catalogQuery));
+  });
+  const catalogSearch = el("input", {
+    type: "search", class: "lpg-status-catalog-search", value: state.lpgStatusCatalogQuery,
+    placeholder: "Search target, symbol, market...", "aria-label": "Search entitlement candidates",
+  });
+  catalogSearch.oninput = event => {
+    state.lpgStatusCatalogQuery = event.target.value || "";
+    renderLpgStatus(data);
+    const next = document.querySelector(".lpg-status-catalog-search");
+    if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
+  };
+  const catalogSelect = el("select", { "aria-label": "Filter entitlement candidates" }, [
+    el("option", { value: "attention", text: "Needs review / 待处理" }),
+    el("option", { value: "all", text: "All candidates / 全部" }),
+    el("option", { value: "entitled", text: "Entitled / 已授权" }),
+    el("option", { value: "pending_review", text: "Pending / 待确认" }),
+    el("option", { value: "error", text: "Formula/session error / 公式或会话异常" }),
+    el("option", { value: "unentitled", text: "Unentitled / 未授权" }),
+  ]);
+  catalogSelect.value = catalogFilter;
+  catalogSelect.onchange = event => {
+    state.lpgStatusCatalogFilter = event.target.value;
+    renderLpgStatus(data);
+  };
+  const matrixToolbar = el("div", { class: "lpg-status-matrix-toolbar" }, [
+    catalogSearch, catalogSelect,
+    el("span", { class: "meta", text: `${filteredMatrix.length}/${matrix.length} candidates` }),
+  ]);
+
+  const combinedSources = [
+    ...sources.map(row => ({ ...row, channel: "market / licensed", source_name: row.source || row.name })),
+    ...newsSources.map(row => ({ ...row, channel: row.kind || "news", source_name: row.source_name || row.source_id })),
+  ].sort((a, b) => {
+    const issue = row => ["error", "failed", "stale", "not_configured"].includes(String(row.status || row.state || "").toLowerCase()) ? 0 : 1;
+    return issue(a) - issue(b) || String(a.source_name || "").localeCompare(String(b.source_name || ""));
+  });
+  const newsHealthy = newsSources.filter(row => ["healthy", "empty"].includes(String(row.status || "").toLowerCase())).length;
+  const sourceIssues = combinedSources.filter(row => ["error", "failed", "stale"].includes(String(row.status || row.state || "").toLowerCase())).length;
+  const sourceStrip = el("div", { class: "lpg-stat-strip lpg-status-source-stats" }, [
+    lpgStat("Market sources active", sources.filter(row => lpgStateInfo(row.status).cls === "ok").length),
+    lpgStat("News feeds healthy", `${newsHealthy}/${newsSources.length}`),
+    lpgStat("Source issues", sourceIssues),
+    lpgStat("Licensed news API", data.news_api_configured ? "Configured" : "Not configured"),
+  ]);
+
+  const coverageStrip = el("div", { class: "lpg-stat-strip lpg-status-summary" }, [
+    lpgStat("Visible now", `${Number(summary.visible_now ?? datasets.filter(row => row.visible_now).length)}/${datasets.length}`),
+    lpgStat("Ready", Number(summary.available ?? datasetCounts.available)),
+    lpgStat("Limited", Number(summary.limited ?? datasets.filter(row => row.availability_group === "limited").length)),
+    lpgStat("Not loaded", Number(summary.not_loaded ?? datasets.filter(row => row.availability_group === "not_loaded").length)),
+    lpgStat("Not connected", Number(summary.unavailable ?? datasetCounts.unavailable)),
+    lpgStat("Refresh issues", Number(summary.refresh_issues || 0)),
+  ]);
+  const accessStrip = el("div", { class: "lpg-stat-strip lpg-status-access-stats" }, [
+    lpgStat("Active entitled series", Number(states.entitled || 0).toLocaleString()),
+    lpgStat("Discovery candidates", Number(candidates.total || matrix.length || 0).toLocaleString()),
+    lpgStat("Confirmed candidates", Number(candidateStates.entitled || 0).toLocaleString()),
+    lpgStat("Pending symbol review", Number(candidateStates.pending_review || 0).toLocaleString()),
+    lpgStat("Session/formula errors", Number(candidateStates.error || 0).toLocaleString()),
+    lpgStat("Confirmed unentitled", Number(candidateStates.unentitled || 0).toLocaleString()),
+  ]);
+  const boundary = el("div", { class: "lpg-status-boundary" }, [
+    el("strong", { text: "Availability ≠ latest refresh ≠ entitlement / 可见数据、最近刷新、授权结论相互独立" }),
+    el("span", { text: "A failed retry no longer hides last-good rows. Pending or formula errors are not labelled unentitled unless symbol-level evidence confirms that conclusion." }),
+  ]);
+
   const database = data.database;
   const databaseLine = database ? el("div", { class: "lpg-database-line" }, [
     el("strong", { text: "Local database" }),
@@ -2669,64 +3098,54 @@ function renderLpgStatus(data) {
   ]) : null;
   if (activeJob) adoptLpgActiveRefresh(activeJob);
   byId("lpg-body").replaceChildren(
-    lpgSection("Coverage & Entitlements", `Updated ${lpgDate(data.updated_at, true)}`, [statStrip, databaseLine]),
-    lpgSection("Dataset Availability", `${datasets.length} datasets`, lpgTable([
-      { label: "Dataset", render: row => datasetLabels[row.dataset] || row.dataset },
-      { label: "State", render: row => lpgBadge(row.status || "not_loaded", false, row.reason || "") },
-      { label: "Refresh", render: row => row.dataset === "fundamentals"
-        ? lpgBadge("unavailable", false, "The backend has no Fundamentals refresh pipeline.")
-        : ["history", "curves", "moc"].includes(row.dataset)
-          ? lpgBadge(lpgValue(row.refresh_job || {}, "state", "status") || "not_loaded", false,
-            row.refresh_job ? row.refresh_job.error || "" : "No specialized job is recorded in this server session.")
-          : el("span", { class: "meta", text: "Shared pipeline / 共享刷新" }) },
-      { label: "Rows", class: "num", render: row => Number(row.rows || 0).toLocaleString() },
-      { label: "Dates", class: "num", render: row => Number(row.dates || 0).toLocaleString() },
-      { label: "Series", class: "num", render: row => Number(row.series || 0).toLocaleString() },
-      { label: "Coverage", render: row => [row.first_date, row.last_date].filter(Boolean).map(lpgDate).join(" to ") || "Not loaded" },
-      { label: "Structure", render: row => row.dataset === "history"
-        ? `${Number(row.multi_date_series || 0)} multi-date series`
-        : row.dataset === "curves"
-          ? `${Number(row.official_series || 0)} official | ${Number(row.derived_series || 0)} derived`
-          : "N/A" },
-      { label: "Reason", render: row => row.reason ? String(row.reason).replace(/_/g, " ") : "Ready" },
-    ], datasets, { empty: "Dataset health not loaded / 数据集状态尚未加载" })),
-    lpgSection("Entitlement Matrix", `${matrix.length} candidates`, lpgTable([
-      { label: "Target", render: row => lpgValue(row, "name", "canonical_key", "candidate_id") },
-      { label: "Symbol / Curve", render: row => lpgValue(row, "mapped_symbol", "discovered_symbol", "discovered_curve_code") || "Pending discovery" },
-      { label: "Market", render: row => [row.product, row.market, row.location].filter(Boolean).join(" | ") || "N/A" },
-      { label: "Access", render: row => lpgBadge(lpgValue(row, "discovery_status", "entitlement_state", "status")) },
-      { label: "Coverage", render: row => [row.first_date, row.last_date].filter(Boolean).map(lpgDate).join(" to ") || "N/A" },
-      { label: "Reason", render: row => row.error || row.entitlement_reason || "N/A" },
-    ], matrix, { empty: "Entitlement discovery has not run / 尚未执行授权发现" })),
-    lpgSection("Source Health", `${sources.length} sources`, lpgTable([
-      { label: "Source", render: row => lpgValue(row, "source", "name") },
-      { label: "State", render: row => lpgBadge(lpgValue(row, "status", "state"), lpgIsStale(row), row.error || "") },
-      { label: "Last success", render: row => lpgDate(row.last_success_at, true) },
-      { label: "Last attempt", render: row => lpgDate(row.last_attempt_at, true) },
-      { label: "Message", render: row => row.error || row.message || "OK" },
-    ], sources, { empty: "No source checks recorded / 暂无数据源检查" })),
-    lpgSection("Specialized Refresh Jobs", `${specializedJobs.length} recent jobs`, lpgTable([
-      { label: "Job", render: row => lpgValue(row, "id", "job_id", "run_id") },
-      { label: "Scope", render: row => row.scope || "N/A" },
-      { label: "State", render: row => lpgBadge(lpgValue(row, "state", "status") || "not_loaded") },
-      { label: "Started", render: row => lpgDate(row.started_at || row.created_at, true) },
-      { label: "Finished", render: row => lpgDate(row.finished_at, true) },
-      { label: "Rows", class: "num", render: row => lpgRefreshRows(row) },
-      { label: "Message", render: row => row.error
-        || lpgValue(row.result || {}, "message", "reason", "error")
-        || (row.scope === "moc" && row.result && row.result.fundamentals
-          && row.result.fundamentals.state === "unavailable" ? "MOC completed; Fundamentals refresh unavailable" : "")
-        || (["queued", "running"].includes(String(row.state || "").toLowerCase()) ? "Background job active" : "N/A") },
-    ], specializedJobs, { empty: "No specialized refresh jobs recorded / 尚无专项刷新任务" })),
-    lpgSection("Refresh Runs", `${runs.length} recent runs`, lpgTable([
-      { label: "Run", render: row => lpgValue(row, "id", "job_id", "run_id") },
-      { label: "Scope", render: row => [row.source, row.scope].filter(Boolean).join(" / ") || "N/A" },
-      { label: "State", render: row => lpgBadge(lpgValue(row, "status", "state")) },
-      { label: "Started", render: row => lpgDate(row.started_at, true) },
-      { label: "Finished", render: row => lpgDate(row.finished_at, true) },
-      { label: "Rows", class: "num", render: row => lpgRefreshRows(row) },
-      { label: "Message", render: row => row.error || row.message || "N/A" },
-    ], runs, { empty: "No refresh runs recorded / 暂无刷新记录" })),
+    lpgSection("Coverage & Entitlements", `Updated ${lpgDate(data.updated_at, true)}`, [coverageStrip, accessStrip, boundary]),
+    lpgSection("Dataset Availability", `${visibleDatasets.length}/${datasets.length} shown`, [availabilityToolbar, availabilityGrid], "lpg-status-availability"),
+    lpgSection("Entitlement Matrix", "Errors are diagnostic, not automatic denials", [
+      matrixToolbar,
+      lpgTable([
+        { label: "Family", render: row => row.family || "N/A" },
+        { label: "Target", render: row => lpgValue(row, "name", "canonical_key", "candidate_id") },
+        { label: "Symbol / Curve", render: row => lpgValue(row, "mapped_symbol", "discovered_symbol", "discovered_curve_code") || "Pending discovery" },
+        { label: "Market", render: row => [row.product, row.market, row.location].filter(Boolean).join(" | ") || "N/A" },
+        { label: "Access", render: row => lpgBadge(lpgValue(row, "discovery_status", "entitlement_state", "status")) },
+        { label: "Coverage", render: row => [row.first_date, row.last_date].filter(Boolean).map(lpgDate).join(" to ") || "N/A" },
+        { label: "Last checked", render: row => lpgDate(row.last_checked_at, true) },
+        { label: "Explanation", render: lpgCandidateReason },
+      ], filteredMatrix, { empty: "No candidates match this filter / 没有符合筛选条件的候选项" }),
+    ]),
+    lpgSection("Source Health", `${combinedSources.length} market and news sources`, [
+      sourceStrip,
+      lpgTable([
+        { label: "Source", render: row => row.source_name || row.source_id || row.source || "N/A" },
+        { label: "Channel", render: row => row.channel || row.kind || "N/A" },
+        { label: "State", render: row => lpgBadge(lpgValue(row, "status", "state"), lpgIsStale(row), row.error || "") },
+        { label: "Last success", render: row => lpgDate(row.last_success_at, true) },
+        { label: "Last attempt", render: row => lpgDate(row.last_attempt_at, true) },
+        { label: "Useful rows", class: "num", render: row => Number(row.relevant_count ?? row.entitled_count ?? row.series_count ?? 0).toLocaleString() },
+        { label: "Message", render: row => row.error || row.message || (String(row.status).toLowerCase() === "empty" ? "Healthy response; no matching LPG item" : "OK") },
+      ], combinedSources, { empty: "No source checks recorded / 暂无数据源检查" }),
+    ]),
+    lpgDisclosure("Refresh & storage diagnostics / 刷新及存储诊断", `${specializedJobs.length} live jobs · ${runs.length} stored runs`, [
+      databaseLine,
+      lpgSection("Server-session specialized jobs", `${specializedJobs.length} jobs`, lpgTable([
+        { label: "Job", render: row => lpgValue(row, "id", "job_id", "run_id") },
+        { label: "Scope", render: row => row.scope || "N/A" },
+        { label: "State", render: row => lpgBadge(lpgValue(row, "state", "status") || "not_loaded") },
+        { label: "Started", render: row => lpgDate(row.started_at || row.created_at, true) },
+        { label: "Finished", render: row => lpgDate(row.finished_at, true) },
+        { label: "Rows", class: "num", render: row => lpgRefreshRows(row) },
+        { label: "Message", render: row => row.error || lpgValue(row.result || {}, "message", "reason", "error") || "N/A" },
+      ], specializedJobs, { empty: "No specialized jobs in this server session / 当前服务会话无专项任务" })),
+      lpgSection("Stored ingestion runs", `${runs.length} recent runs`, lpgTable([
+        { label: "Run", render: row => lpgValue(row, "id", "job_id", "run_id") },
+        { label: "Scope", render: row => [row.source, row.scope].filter(Boolean).join(" / ") || "N/A" },
+        { label: "State", render: row => lpgBadge(lpgValue(row, "status", "state")) },
+        { label: "Started", render: row => lpgDate(row.started_at, true) },
+        { label: "Finished", render: row => lpgDate(row.finished_at, true) },
+        { label: "Rows", class: "num", render: row => lpgRefreshRows(row) },
+        { label: "Message", render: row => row.error || row.message || "N/A" },
+      ], runs, { empty: "No refresh runs recorded / 暂无刷新记录" })),
+    ]),
   );
 }
 

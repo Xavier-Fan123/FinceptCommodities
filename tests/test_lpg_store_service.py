@@ -214,7 +214,13 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             datasets["moc"]["rows"], datasets["moc"]["dates"],
             datasets["moc"]["series"], datasets["moc"]["status"],
         ))
-        self.assertEqual("ready", datasets["fundamentals"]["status"])
+        self.assertEqual(("available_with_warning", "ready", "not_supported"), (
+            datasets["fundamentals"]["status"],
+            datasets["fundamentals"]["coverage_status"],
+            datasets["fundamentals"]["refresh_status"],
+        ))
+        self.assertTrue(datasets["fundamentals"]["visible_now"])
+        self.assertFalse(datasets["fundamentals"]["refresh_supported"])
 
     def test_official_and_derived_prompt_curves_have_distinct_provenance(self):
         component_ids = []
@@ -226,23 +232,36 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             self.add_series(tenor, canonical)
             self.add_observation(tenor, "2026-07-10", value)
             component_ids.append(tenor)
+        for tenor, value in (("hm1", 522), ("hm2", 525), ("hm3", 528)):
+            self.add_observation(tenor, "2026-07-11", value)
 
         derived_only = self.service.curves()
-        self.assertEqual(("derived_only", 0, 1), (
+        self.assertEqual(("ready", 0, 1), (
             derived_only["status"], derived_only["official_curve_count"],
             derived_only["derived_curve_count"],
         ))
         derived = derived_only["curves"][0]
         self.assertTrue(derived["derived"])
         self.assertFalse(derived["is_official"])
-        self.assertEqual("derived_prompt_structure", derived["curve_kind"])
+        self.assertEqual("daily_derived_assessment_curve", derived["curve_kind"])
         self.assertEqual("hm1", derived["series_id"])
         self.assertEqual(component_ids, derived["component_series_ids"])
         self.assertEqual(["HM1", "HM2", "HM3"],
                          [point["tenor"] for point in derived["points"]])
+        self.assertEqual((2, "contango", -3, -3), (
+            derived["history_count"], derived["shape"]["structure"],
+            derived["shape"]["hm1_hm2"], derived["shape"]["hm2_hm3"],
+        ))
+        self.assertEqual(["2026-07-10", "2026-07-11"], derived["available_dates"])
+        self.assertEqual([2, 1, -1], [point["day_change"] for point in derived["points"]])
         self.assertTrue(all(point["source_series_id"] in component_ids
                             for point in derived["points"]))
         self.assertIn("not an official Platts FC curve", derived["methodology"])
+        curve_health = self.service.status()["datasets"]["curves"]
+        self.assertEqual(("available_with_warning", "limited", "all", False), (
+            curve_health["status"], curve_health["availability_group"],
+            curve_health["refresh_scope"], curve_health["official_refresh_supported"],
+        ))
 
         self.add_series("official", "CURVE_FEI_PROPANE", quote_kind="curve")
         self.store.upsert_curve_point({
@@ -262,6 +281,103 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
         self.assertEqual((4, 2), (
             combined["dataset_status"]["rows"], combined["dataset_status"]["series"],
         ))
+
+    def test_daily_derived_curve_never_forward_fills_a_missing_tenor(self):
+        for tenor, canonical in (
+            ("hm1", "FEI_PROPANE_HM1"),
+            ("hm2", "FEI_PROPANE_HM2"),
+            ("hm3", "FEI_PROPANE_HM3"),
+        ):
+            self.add_series(tenor, canonical)
+            self.add_observation(tenor, "2026-07-10", 520)
+        self.add_observation("hm1", "2026-07-11", 525)
+        self.add_observation("hm2", "2026-07-11", 523)
+
+        curve = self.service.curves(as_of="2026-07-11")["curves"][0]
+
+        self.assertEqual(("2026-07-10", ["2026-07-10"], 1), (
+            curve["as_of_date"], curve["available_dates"], curve["history_count"],
+        ))
+
+    def test_six_leg_quality_keeps_incomplete_inputs_but_skips_that_curve_date(self):
+        specs = (
+            ("p1", "FEI_PROPANE_HM1", 520),
+            ("p2", "FEI_PROPANE_HM2", 515),
+            ("p3", "FEI_PROPANE_HM3", 510),
+            ("b1", "CFR_NA_BUTANE_HM1", 525),
+            ("b2", "CFR_NA_BUTANE_HM2", 520),
+            ("b3", "CFR_NA_BUTANE_HM3", 515),
+        )
+        for series_id, canonical, value in specs:
+            self.add_series(series_id, canonical)
+            self.add_observation(series_id, "2026-07-10", value)
+            if series_id != "b3":
+                self.add_observation(series_id, "2026-07-11", value + 2)
+
+        payload = self.service.curves(as_of="2026-07-11")
+        propane = next(row for row in payload["curves"]
+                       if row["canonical_key"] == "FEI_PROPANE_PROMPT_STRUCTURE")
+        butane = next(row for row in payload["curves"]
+                      if row["canonical_key"] == "CFR_NA_BUTANE_PROMPT_STRUCTURE")
+        quality = payload["quality"]
+
+        self.assertEqual("2026-07-11", propane["as_of_date"])
+        self.assertEqual(("2026-07-10", 1), (butane["as_of_date"], butane["history_count"]))
+        self.assertEqual((6, 6, "2026-07-10"), (
+            quality["expected_legs"], quality["available_legs"],
+            quality["latest_common_date"],
+        ))
+        self.assertEqual(["CFR_NA_BUTANE_HM3"], quality["missing_latest_legs"])
+        self.assertIn("six_leg_latest_date_incomplete", quality["reason_codes"])
+        self.assertEqual(["2026-07-10", "2026-07-11"],
+                         [row["date"] for row in self.store.history("b1")])
+
+    def test_curve_quality_flags_large_moves_without_dropping_values(self):
+        for index, canonical in enumerate((
+            "FEI_PROPANE_HM1", "FEI_PROPANE_HM2", "FEI_PROPANE_HM3",
+            "CFR_NA_BUTANE_HM1", "CFR_NA_BUTANE_HM2", "CFR_NA_BUTANE_HM3",
+        )):
+            series_id = f"leg-{index}"
+            self.add_series(series_id, canonical)
+            self.add_observation(series_id, "2026-07-09", 500 + index)
+            self.add_observation(series_id, "2026-07-10", 505 + index)
+            self.add_observation(series_id, "2026-07-11", 570 + index)
+
+        payload = self.service.curves(as_of="2026-07-11")
+
+        self.assertEqual("warning", payload["quality"]["status"])
+        self.assertEqual(6, payload["quality"]["anomaly_count"])
+        self.assertIn("abnormal_daily_jump_detected", payload["quality"]["reason_codes"])
+        self.assertTrue(all(curve["as_of_date"] == "2026-07-11"
+                            for curve in payload["curves"]))
+        self.assertEqual(570, self.store.history("leg-0")[-1]["value"])
+
+    def test_curve_quality_surfaces_duplicate_daily_inputs_deterministically(self):
+        for index, canonical in enumerate((
+            "FEI_PROPANE_HM1", "FEI_PROPANE_HM2", "FEI_PROPANE_HM3",
+            "CFR_NA_BUTANE_HM1", "CFR_NA_BUTANE_HM2", "CFR_NA_BUTANE_HM3",
+        )):
+            series_id = f"leg-{index}"
+            self.add_series(series_id, canonical)
+            self.add_observation(series_id, "2026-07-10", 500 + index)
+        original_history = self.store.history
+
+        def history_with_duplicate(series_id, *args, **kwargs):
+            rows = original_history(series_id, *args, **kwargs)
+            if series_id == "leg-0" and rows:
+                duplicate = {**rows[-1], "id": 9999,
+                             "fetched_at": "2026-07-10T02:00:00+00:00"}
+                return [*rows, duplicate]
+            return rows
+
+        with patch.object(self.store, "history", side_effect=history_with_duplicate):
+            payload = self.service.curves(as_of="2026-07-10")
+
+        self.assertEqual(1, payload["quality"]["duplicate_record_count"])
+        self.assertIn("duplicate_curve_input_records", payload["quality"]["reason_codes"])
+        propane = next(row for row in payload["curves"]
+                       if row["canonical_key"] == "FEI_PROPANE_PROMPT_STRUCTURE")
+        self.assertEqual("derived:9999", propane["points"][0]["id"])
 
     def test_empty_curve_response_explains_missing_inputs(self):
         payload = self.service.curves()
@@ -371,6 +487,29 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             candidate["mapped_symbol"],
         ))
 
+    def test_valid_empty_moc_snapshot_is_not_an_ingestion_failure(self):
+        result = self.service.import_platts_staging({
+            "schema_version": 1,
+            "generated_at": FIXED_FETCHED_AT,
+            "scope": "asia",
+            "status": "empty",
+            "records": [],
+            "entitlement_results": [{
+                "candidate_id": "ewindow_asia_asia_lpg",
+                "canonical_key": "EWINDOW_LPG_TRADES",
+                "series_id": "platts_ewindow_asia_asia_lpg",
+                "dataset": "eWMD",
+                "data_series": "TradeData",
+                "status": "pending_review",
+                "reason_code": "empty_result",
+            }],
+            "errors": [],
+        })
+
+        self.assertEqual((True, "success", 0), (
+            result["success"], result["status"], result["counts"]["rows_seen"],
+        ))
+
     def test_ewindow_import_uses_stable_order_identity_for_updates(self):
         def payload(records, generated_at):
             return {
@@ -458,6 +597,15 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
                 "error_count": 1,
                 "reason_codes": [reason],
             }), encoding="utf-8")
+        (staging / "status.json").write_text(json.dumps({
+            "schema_version": 1,
+            "updated_at": FIXED_FETCHED_AT,
+            "scope": "asia",
+            "state": "failed",
+            "record_count": 0,
+            "error_count": 1,
+            "reason_codes": ["daily_formula_failed"],
+        }), encoding="utf-8")
 
         with patch("lpg.platts_excel.STAGING_DIR", staging):
             history = self.service.series_history("fei")
@@ -465,11 +613,12 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             moc = self.service.explorer(dataset="moc")
             status = self.service.status()
 
-        self.assertEqual(("failed", "refresh_failed", "history_formula_failed"), (
+        self.assertEqual(("failed", "available_with_warning", "history_formula_failed"), (
             history["refresh_state"], history["availability"]["status"],
             history["availability"]["reason"],
         ))
-        self.assertEqual(("failed", "refresh_failed", "curve_formula_failed"), (
+        self.assertEqual("limited", history["availability"]["coverage_status"])
+        self.assertEqual(("failed", "refresh_failed", "daily_formula_failed"), (
             curves["refresh_state"], curves["dataset_status"]["status"],
             curves["dataset_status"]["reason"],
         ))
@@ -477,7 +626,9 @@ class StoreServiceTests(WorkspaceScratchMixin, unittest.TestCase):
             moc["refresh_state"], moc["dataset_status"]["status"],
             moc["dataset_status"]["reason"],
         ))
-        self.assertEqual("refresh_failed", status["datasets"]["history"]["status"])
+        self.assertEqual("available_with_warning", status["datasets"]["history"]["status"])
+        self.assertEqual("limited", status["datasets"]["history"]["availability_group"])
+        self.assertTrue(status["datasets"]["history"]["visible_now"])
         self.assertEqual("refresh_failed", status["datasets"]["curves"]["status"])
         self.assertEqual("refresh_failed", status["datasets"]["moc"]["status"])
         self.assertEqual({"history", "curves", "moc"}, set(status["specialized_runtime"]))
